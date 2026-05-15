@@ -1,0 +1,10 @@
+{
+  "name": "torchbridgebench",
+  "description": "Claude Code plugin for evaluating PyTorch-to-MindSpore bridge migration burden with structured benchmark runs and agent workflows.",
+  "version": "0.1.0",
+  "author": {
+    "name": "TorchBridgeBench contributors"
+  },
+  "homepage": "https://github.com/TeleHuang/TBBCC",
+  "license": "UNLICENSED"
+}
