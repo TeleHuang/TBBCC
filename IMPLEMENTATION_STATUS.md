@@ -39,6 +39,12 @@ implementation.
   - minimal PyTorch tensor smoke suite,
   - Tier-2 activation drift smoke suite,
   - Tier-3 task metric drift smoke suite.
+- Static benchmark library:
+  - `benchmarks/v1.0.0/`
+  - 175 generated static TestCase JSON files
+  - counts: L1=67, L2=42, L3=25, L4=41
+  - per-level noop suites, a fast development suite, and a lightweight
+    cross-level smoke suite
 - Runtime documentation:
   - development loading with `--plugin-dir`,
   - plugin validation,
@@ -81,12 +87,30 @@ python scripts/tbbcc.py eval-suite \
 python scripts/tbbcc.py eval-suite \
   --suite examples/suites/tier3_smoke.json \
   --out reports/final_tier3_suite
+
+python scripts/generate_benchmark_library.py
+
+python scripts/tbbcc.py eval-suite \
+  --suite benchmarks/v1.0.0/suites/smoke_noop.json \
+  --out reports/bench_smoke_retry \
+  --timeout 180
 ```
 
 Expected `local_smoke` result: `3/4` pass and one `NumericMismatch`.
 Expected `torch_smoke` result: `1/2` pass and one `NumericMismatch`.
 Expected `tier2_smoke` result: `1/2` pass and one Tier-2 `NumericMismatch`.
 Expected `tier3_smoke` result: `1/2` pass and one `TrainingDivergence`.
+Expected `bench_smoke_retry` result: `4/4` pass.
+
+Observed timing on the current machine:
+
+- single local eval (`pure_python_vector` + `noop`): about `0.21s`
+- generated `dev_noop` suite: about `9-10s`
+- generated cross-level `smoke_noop` suite: about `125s`
+
+Interpretation: the harness flow itself is lightweight; the expensive portion is
+the real PyTorch L3/L4 benchmark content rather than plugin orchestration
+overhead.
 
 ## Deliberate Gaps
 
@@ -96,8 +120,12 @@ Expected `tier3_smoke` result: `1/2` pass and one `TrainingDivergence`.
   generic `TASK_METRICS` comparison channel is implemented.
 - Monte Carlo repair sampling and ME/AR/migrate@k aggregation are not automated
   in the deterministic core yet.
-- Real PyTorch/MindSpore framework cases are not bundled yet; the current cases
-  are pure Python smoke tests for harness validation.
+- The plugin does not yet automate the full adapt -> confirm -> repair state
+  machine end-to-end; the current separation is documented through skills and
+  agents.
+- Framework-backed benchmark cases are now bundled as static JSON, but they have
+  only been smoke-verified with the local `noop` adapter. Full bridge-by-bridge
+  execution coverage is still pending.
 - Marketplace packaging is documented but not materialized as a separate
   marketplace root, because this directory is the plugin root and marketplace
   relative sources must not use `../`.

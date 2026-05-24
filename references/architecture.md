@@ -3,6 +3,10 @@
 TorchBridgeBench measures migration burden for PyTorch-to-MindSpore/Ascend
 bridges and translators.
 
+This plugin treats `ClaudeCodePluginDesign.md` as the source of truth. The
+implementation here follows the closed decisions in that document and calls out
+where the current plugin is still partial.
+
 ## Tracks
 
 - `intercept`: PyTorch code remains mostly intact while adapter or bridge
@@ -13,7 +17,21 @@ bridges and translators.
 Report track-specific rankings separately. Migration effort is not identical
 across tracks.
 
-## Layers
+## Closed Decisions
+
+- D1 Benchmark prebuild: benchmark cases are materialized as static JSON under
+  `benchmarks/v1.0.0/`.
+- D2 Layered verification with fail-fast: verification is ordered T1 -> T2 ->
+  T3, and any failing tier blocks the pass path until classification and repair.
+- D3 Agent split: adapt effort and repair effort are conceptually distinct.
+- D4 Track split: intercept uses adapter/preamble style migration, translate
+  uses translated target code.
+- D5 Independent failure confirmation: classification confirmation is separate
+  from repair.
+- D6 Monte Carlo is for agent repair sampling, not deterministic tensor
+  comparison.
+
+## Verification Layers
 
 The target architecture has three verification tiers:
 
@@ -22,11 +40,15 @@ The target architecture has three verification tiers:
    gradient is identified.
 3. Tier-3 Task: training or task metrics remain within accepted drift.
 
-The current plugin core implements Tier-1 and a generic Tier-2 channel contract:
-test code may expose `ACTIVATIONS` and/or `GRADIENTS`, and the core compares
-those structures after Tier-1. Tier-3 has a generic `TASK_METRICS` contract for
-loss curves, accuracy, and task-level values. Framework hook and training-loop
-automation can populate these fields in a later iteration.
+The current plugin core implements Tier-1 and generic Tier-2 / Tier-3 channel
+contracts:
+
+- Tier-2: test code may expose `ACTIVATIONS` and/or `GRADIENTS`.
+- Tier-3: test code may expose `TASK_METRICS`.
+
+This means the report schema and deterministic comparisons already match the
+design intent, while framework hook automation and training-loop instrumentation
+remain future work.
 
 ## Agent Boundary
 
@@ -40,6 +62,14 @@ Claude Code agents represent the migration user. They may:
 
 They should not silently patch bridge internals. Bridge fixes belong to a
 different project.
+
+Current implementation status:
+
+- `agents/diagnostician.md` models the independent confirmation role.
+- `agents/repairer.md` models user-side repair only.
+- The plugin does not yet automate the full end-to-end state machine with stored
+  `AgentContext`, MC repair sampling, or baseline effort scoring inside the core
+  CLI.
 
 ## Dual-System Plan
 

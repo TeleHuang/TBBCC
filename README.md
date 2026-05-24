@@ -62,6 +62,66 @@ claude --plugin-dir . plugin details torchbridgebench
 Additional installation and cache notes are in
 `references/installation-debugging.md`.
 
+## Benchmark Library
+
+The static benchmark catalog generated from `ClaudeCodePluginDesign.md`
+Appendix A lives under:
+
+```text
+benchmarks/v1.0.0/cases/
+benchmarks/v1.0.0/suites/
+benchmarks/v1.0.0/manifest.json
+```
+
+Rebuild the catalog after editing the generator:
+
+```bash
+python scripts/generate_benchmark_library.py
+```
+
+Validate every generated case JSON:
+
+```bash
+python scripts/tbbcc.py validate-inputs \
+  --case benchmarks/v1.0.0/cases/L1/conv/conv2d_fp32.json
+```
+
+Run the bundled cross-level smoke suite:
+
+```bash
+python scripts/tbbcc.py eval-suite \
+  --suite benchmarks/v1.0.0/suites/smoke_noop.json \
+  --out reports/bench_smoke_retry \
+  --timeout 180
+```
+
+Run the fast development suite when you only need to validate the evaluation
+flow itself:
+
+```bash
+python scripts/tbbcc.py eval-suite \
+  --suite benchmarks/v1.0.0/suites/dev_noop.json \
+  --out reports/bench_dev_noop
+```
+
+Observed on the current machine:
+
+- `examples/cases/pure_python_vector.json` with `noop`: about `0.21s` wall
+  clock.
+- `benchmarks/v1.0.0/suites/dev_noop.json`: about `9-10s`.
+- `benchmarks/v1.0.0/suites/smoke_noop.json`: about `125s`, because it includes
+  real L3/L4 benchmark cases.
+
+Run the full generated matrix when you want exhaustive coverage instead of a
+quick smoke:
+
+```bash
+python scripts/tbbcc.py eval-suite \
+  --suite benchmarks/v1.0.0/suites/all_noop.json \
+  --out reports/bench_all_noop \
+  --timeout 180
+```
+
 ## Version Control
 
 Repository: https://github.com/TeleHuang/TBBCC
@@ -73,7 +133,7 @@ Use semantic versions for plugin releases. The current development baseline is
 
 ```text
 .claude-plugin/plugin.json       Plugin manifest
-skills/eval/SKILL.md             Primary Claude Code workflow
+skills/torchbridgebench/SKILL.md Primary Claude Code workflow
 skills/inspect/SKILL.md          Project and environment inspection workflow
 agents/evaluator.md              Runs deterministic evaluation
 agents/diagnostician.md          Confirms failure classification
@@ -82,6 +142,7 @@ references/                      Progressive-disclosure design notes
 scripts/tbbcc.py                 Deterministic benchmark core
 bin/tbbcc                        Plugin PATH wrapper for the core
 examples/                        Self-contained smoke inputs
+benchmarks/                      Static benchmark library generated from Appendix A
 ```
 
 ## Runtime Model
@@ -103,3 +164,13 @@ The current core implements:
 - Tier-2 generic activation/gradient comparison through optional `ACTIVATIONS`
   and `GRADIENTS`.
 - Tier-3 generic task metric comparison through optional `TASK_METRICS`.
+
+Design alignment notes:
+
+- The benchmark catalog is prebuilt as static JSON, matching design decision
+  D1.
+- Tier execution is still ordered T1 -> T2 -> T3 and only implemented tiers are
+  checked on the pass path.
+- Classification and repair remain separate agent roles.
+- MC repair sampling, explicit agent-context accumulation, and baseline effort
+  measurement are still not automated in this plugin root.
