@@ -9,6 +9,7 @@ the harness only requires the case to expose a JSON-normalizable RESULT or run()
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import datetime as _dt
 import importlib.util
@@ -251,8 +252,8 @@ def execute_python(role: str, preamble: str, code: str, env: dict[str, str], tim
                 task_metrics=None,
                 returncode=124,
                 duration_seconds=(end - start).total_seconds(),
-                stdout=exc.stdout or "",
-                stderr=exc.stderr or f"Timeout after {timeout}s",
+                stdout=_coerce_text(exc.stdout),
+                stderr=_coerce_text(exc.stderr) or f"Timeout after {timeout}s",
                 traceback=f"Timeout after {timeout}s",
             )
     end = _dt.datetime.now(_dt.UTC)
@@ -273,11 +274,198 @@ def execute_python(role: str, preamble: str, code: str, env: dict[str, str], tim
     )
 
 
+def _pair_runner_source(source_preamble: str, target_preamble: str, code: str, target_env: dict[str, str], timeout: int) -> str:
+    return f"""import contextlib
+import io
+import json
+import math
+import os
+import signal
+import sys
+import time
+import traceback
+
+SOURCE_PREAMBLE = {source_preamble!r}
+TARGET_PREAMBLE = {target_preamble!r}
+CODE = {code!r}
+TARGET_ENV = {target_env!r}
+ROLE_TIMEOUT = {timeout!r}
+
+def _normalize(value):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, float):
+            if math.isnan(value):
+                return {{"__float__": "nan"}}
+            if math.isinf(value):
+                return {{"__float__": "inf" if value > 0 else "-inf"}}
+        return value
+    if isinstance(value, dict):
+        return {{str(k): _normalize(v) for k, v in value.items()}}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(v) for v in value]
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "tolist"):
+        return _normalize(value.tolist())
+    if hasattr(value, "item"):
+        try:
+            return _normalize(value.item())
+        except Exception:
+            pass
+    return repr(value)
+
+class _RoleTimeout(Exception):
+    pass
+
+def _timeout_handler(signum, frame):
+    raise _RoleTimeout(f"Timeout after {{ROLE_TIMEOUT}}s")
+
+def _run_role(role, preamble, env_updates):
+    started = time.perf_counter()
+    ns = {{"__name__": "__main__"}}
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    previous_env = {{}}
+    added_keys = []
+    try:
+        for key, value in env_updates.items():
+            if key in os.environ:
+                previous_env[key] = os.environ[key]
+            else:
+                added_keys.append(key)
+            os.environ[key] = value
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(int(ROLE_TIMEOUT))
+        try:
+            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+                if preamble:
+                    exec(preamble, ns)
+                exec(CODE, ns)
+                if "RESULT" in ns:
+                    result = ns["RESULT"]
+                elif "run" in ns and callable(ns["run"]):
+                    result = ns["run"]()
+                else:
+                    raise RuntimeError("Test code must define RESULT or run().")
+            payload = {{"result": _normalize(result)}}
+            if "ACTIVATIONS" in ns:
+                payload["activations"] = _normalize(ns["ACTIVATIONS"])
+            if "GRADIENTS" in ns:
+                payload["gradients"] = _normalize(ns["GRADIENTS"])
+            if "TASK_METRICS" in ns:
+                payload["task_metrics"] = _normalize(ns["TASK_METRICS"])
+            ok = True
+            returncode = 0
+            tb = None
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+    except Exception:
+        payload = {{}}
+        ok = False
+        returncode = 1
+        tb = traceback.format_exc().strip()
+        stderr_buf.write(tb + "\\n")
+    finally:
+        for key, value in previous_env.items():
+            os.environ[key] = value
+        for key in added_keys:
+            os.environ.pop(key, None)
+    return {{
+        "role": role,
+        "ok": ok,
+        "result": payload.get("result"),
+        "activations": payload.get("activations"),
+        "gradients": payload.get("gradients"),
+        "task_metrics": payload.get("task_metrics"),
+        "returncode": returncode,
+        "duration_seconds": time.perf_counter() - started,
+        "stdout": stdout_buf.getvalue(),
+        "stderr": stderr_buf.getvalue(),
+        "traceback": tb,
+    }}
+
+pair = {{
+    "source": _run_role("source", SOURCE_PREAMBLE, {{}}),
+    "target": _run_role("target", TARGET_PREAMBLE, TARGET_ENV),
+}}
+print("TBBCC_PAIR_JSON=" + json.dumps(pair, sort_keys=True))
+"""
+
+
+def _extract_pair_payload(stdout: str) -> Any:
+    prefix = "TBBCC_PAIR_JSON="
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(prefix):
+            return json.loads(line[len(prefix) :])
+    return _MISSING
+
+
+def execute_python_pair(source_preamble: str, target_preamble: str, code: str, env: dict[str, str], timeout: int) -> tuple[ExecResult, ExecResult]:
+    source = _runner_source(source_preamble, code)
+    target = _runner_source(target_preamble, code)
+    if not source_preamble and not target_preamble and not env:
+        pass
+    pair_source = _pair_runner_source(source_preamble, target_preamble, code, env, timeout)
+    start = _dt.datetime.now(_dt.UTC)
+    with tempfile.TemporaryDirectory(prefix="tbbcc_pair_") as td:
+        script = Path(td) / "pair.py"
+        script.write_text(pair_source, encoding="utf-8")
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                text=True,
+                capture_output=True,
+                env=os.environ.copy(),
+                timeout=max(timeout * 2 + 5, timeout + 5),
+            )
+        except subprocess.TimeoutExpired as exc:
+            end = _dt.datetime.now(_dt.UTC)
+            duration = (end - start).total_seconds()
+            timeout_text = f"Timeout after {timeout}s"
+            src = ExecResult("source", False, None, None, None, None, 124, duration, _coerce_text(exc.stdout), _coerce_text(exc.stderr) or timeout_text, timeout_text)
+            tgt = ExecResult("target", False, None, None, None, None, 124, duration, _coerce_text(exc.stdout), _coerce_text(exc.stderr) or timeout_text, timeout_text)
+            return src, tgt
+    payload = _extract_pair_payload(proc.stdout)
+    if payload is _MISSING:
+        fallback = ExecResult("source", False, None, None, None, None, proc.returncode, 0.0, proc.stdout, proc.stderr, _extract_traceback(proc.stderr))
+        fallback_target = dataclasses.replace(fallback, role="target")
+        return fallback, fallback_target
+
+    def _convert(role: str) -> ExecResult:
+        item = payload.get(role) or {}
+        return ExecResult(
+            role=role,
+            ok=bool(item.get("ok")),
+            result=item.get("result"),
+            activations=item.get("activations"),
+            gradients=item.get("gradients"),
+            task_metrics=item.get("task_metrics"),
+            returncode=int(item.get("returncode", 1)),
+            duration_seconds=float(item.get("duration_seconds", 0.0)),
+            stdout=_coerce_text(item.get("stdout")),
+            stderr=_coerce_text(item.get("stderr")),
+            traceback=item.get("traceback"),
+        )
+
+    return _convert("source"), _convert("target")
+
+
 class _Missing:
     pass
 
 
 _MISSING = _Missing()
+
+
+def _coerce_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _extract_payload(stdout: str) -> Any:
@@ -580,6 +768,11 @@ def build_report(case: TestCase, adapter: AdapterSpec, source: ExecResult, targe
         "case": dataclasses.asdict(case),
         "adapter": dataclasses.asdict(adapter),
         "environment": inspect_environment(),
+        "timing": {
+            "source_duration_seconds": source.duration_seconds,
+            "target_duration_seconds": target.duration_seconds,
+            "combined_execution_seconds": source.duration_seconds + target.duration_seconds,
+        },
         "tiers": {
             "T1": {
                 "name": "Tensor",
@@ -669,6 +862,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     t3 = report["tiers"]["T3"]
     metrics = t1["metrics"]
     cls = t1["auto_classification"]
+    timing = report.get("timing") or {}
     lines = [
         "# TorchBridgeBench Report",
         "",
@@ -678,6 +872,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Tier-1 passed: `{t1['passed']}`",
         f"- Failure class: `{cls['class']}`",
         f"- Counts toward compatibility: `{cls['counts_toward_compatibility']}`",
+        f"- Combined execution seconds: `{timing.get('combined_execution_seconds')}`",
         "",
         "## Tier-1 Metrics",
         "",
@@ -740,6 +935,7 @@ def render_suite_markdown(summary: dict[str, Any]) -> str:
         f"- Passed: `{totals['passed']}`",
         f"- Failed: `{totals['failed']}`",
         f"- Compatibility rate: `{totals['compatibility_rate']:.4f}`",
+        f"- Total duration seconds: `{totals.get('duration_seconds')}`",
         "",
         "## Failure Classes",
         "",
@@ -776,19 +972,20 @@ def _resolve_path(base: Path, value: str) -> Path:
 
 
 def run_eval(case_path: Path, adapter_path: Path, out_dir: Path, timeout_override: int | None = None, atol_override: float | None = None, rtol_override: float | None = None) -> dict[str, Any]:
+    started = _dt.datetime.now(_dt.UTC)
     case = load_case(case_path)
     adapter = load_adapter(adapter_path)
     timeout = int(timeout_override or adapter.timeout_seconds)
     atol = float(atol_override if atol_override is not None else case.ground_truth.get("atol", adapter.atol))
     rtol = float(rtol_override if rtol_override is not None else case.ground_truth.get("rtol", adapter.rtol))
-    source = execute_python("source", adapter.source_preamble, case.code, {}, timeout)
-    target = execute_python("target", adapter.preamble, case.code, adapter.env, timeout)
+    source, target = execute_python_pair(adapter.source_preamble, adapter.preamble, case.code, adapter.env, timeout)
     comparison: dict[str, Any]
     if source.ok and target.ok:
         comparison = compare_values(source.result, target.result, atol, rtol)
     else:
         comparison = {"passed": False, "reason": "ExecutionFailure", "atol": atol, "rtol": rtol}
     report = build_report(case, adapter, source, target, comparison)
+    report["timing"]["wall_clock_seconds"] = (_dt.datetime.now(_dt.UTC) - started).total_seconds()
     json_path, md_path = write_report(report, out_dir)
     report["_paths"] = {"report_json": str(json_path), "report_md": str(md_path)}
     return report
@@ -809,6 +1006,7 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
 
 def cmd_eval_suite(args: argparse.Namespace) -> int:
+    suite_started = _dt.datetime.now(_dt.UTC)
     suite_path = Path(args.suite).resolve()
     suite = _load_json(suite_path)
     suite_id = str(suite.get("suite_id") or suite_path.stem)
@@ -841,6 +1039,7 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
             )
             paths = report.pop("_paths")
             cls = report["tiers"]["T1"]["auto_classification"]["class"]
+            run_duration = report.get("timing", {}).get("wall_clock_seconds")
             if report["final_state"] == "ALL_PASS":
                 passed += 1
             else:
@@ -857,9 +1056,11 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
                     "report_json": paths["report_json"],
                     "report_md": paths["report_md"],
                     "counts_toward_compatibility": report["tiers"]["T1"]["auto_classification"]["counts_toward_compatibility"],
+                    "duration_seconds": run_duration,
                 }
             )
     total = passed + failed
+    suite_duration = (_dt.datetime.now(_dt.UTC) - suite_started).total_seconds()
     summary = {
         "schema_version": "tbbcc.suite.v0.1",
         "suite_id": suite_id,
@@ -870,6 +1071,7 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
             "passed": passed,
             "failed": failed,
             "compatibility_rate": (passed / total) if total else 0.0,
+            "duration_seconds": suite_duration,
         },
         "failure_classes": failure_classes,
         "runs": runs,
