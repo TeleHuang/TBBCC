@@ -11,8 +11,8 @@ claude --plugin-dir /home/ma-user/work/torchbridgebenchCCplugin
 Inside Claude Code:
 
 ```text
-/torchbridgebench:inspect
-/torchbridgebench:eval --case examples/cases/pure_python_vector.json --adapter examples/adapters/noop.json --out reports/smoke
+/torchbridgebench-inspect
+/torchbridgebench --case examples/cases/pure_python_vector.json --adapter examples/adapters/noop.json --out reports/smoke
 /reload-plugins
 ```
 
