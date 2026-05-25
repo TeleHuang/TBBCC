@@ -83,8 +83,53 @@ The core emits:
 - `report.md`: human-readable summary.
 
 Reports include environment, case, adapter, tier results, metrics,
-classification, and counting policy. Future Agent effort fields must be appended
-without breaking existing keys.
+classification, counting policy, and optional agent effort fields.
+
+## Effort Ledger and AR
+
+The deterministic core can consume an optional effort ledger:
+
+```json
+{
+  "entries": [
+    {
+      "case_id": "bench_v1.0.0/L1/conv/conv2d_fp32",
+      "bridge_id": "noop",
+      "phase": "adapt",
+      "reroll_index": 1,
+      "rounds": 1,
+      "prompt_chars": 1200,
+      "completion_chars": 800,
+      "edit_units": 120
+    }
+  ],
+  "migration_samples": [
+    {
+      "task_id": "bench_v1.0.0/L1/conv/conv2d_fp32",
+      "reroll_index": 1,
+      "exec_passed": true,
+      "full_passed": true
+    }
+  ]
+}
+```
+
+Effort uses `shared-effort-v1`:
+
+```text
+ME = rounds + (prompt_chars + completion_chars + edit_units) / 1000.0
+AR = max(0, 1 - ME / effective_baseline_effort)
+```
+
+For a suite, `ME` is the total counted adapt and repair effort across the
+evaluated task set. The primary `AR` always uses the calibrated
+`baseline_effort` artifact directly. If the supplied AR baseline was calibrated
+on a larger task set and the current suite is a strict subset, the summary also
+records `scope_adjusted_ar` using a linear case-count effective baseline. That
+field is a subset diagnostic and must not be presented as the full benchmark AR.
+
+Environment remediation and classification confirmation are not effort ledger
+phases. Only `adapt` and `repair` are counted.
 
 ## Suite
 

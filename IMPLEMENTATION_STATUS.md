@@ -45,6 +45,12 @@ implementation.
   - counts: L1=67, L2=42, L3=25, L4=41
   - per-level noop suites, a fast development suite, and a lightweight
     cross-level smoke suite
+- AR baseline calibration workflow:
+  - `scripts/calibrate_ar_cc.py`
+  - `skills/ar-baseline/SKILL.md`
+  - drives `claude -p` rather than a direct provider SDK
+  - records Claude Code session ids, usage, costs, observed model usage, and the
+    `shared-effort-v1` effort formula
 - Runtime documentation:
   - development loading with `--plugin-dir`,
   - plugin validation,
@@ -94,6 +100,13 @@ python scripts/tbbcc.py eval-suite \
   --suite benchmarks/v1.0.0/suites/smoke_noop.json \
   --out reports/bench_smoke_retry \
   --timeout 180
+
+python scripts/calibrate_ar_cc.py \
+  --suite benchmarks/v1.0.0/suites/all_noop.json \
+  --out reports/ar_baseline/deepseek-v4-pro-cc-v1 \
+  --rerolls 1 \
+  --workers 1 \
+  --model 'deepseek-v4-pro[1m]'
 ```
 
 Expected `local_smoke` result: `3/4` pass and one `NumericMismatch`.
@@ -120,6 +133,8 @@ overhead.
   generic `TASK_METRICS` comparison channel is implemented.
 - Monte Carlo repair sampling and ME/AR/migrate@k aggregation are not automated
   in the deterministic core yet.
+- AR baseline calibration is automated as a Claude Code workflow, but full
+  constant publication depends on completing the selected calibration run.
 - The plugin does not yet automate the full adapt -> confirm -> repair state
   machine end-to-end; the current separation is documented through skills and
   agents.

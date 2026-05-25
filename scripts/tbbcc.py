@@ -27,6 +27,8 @@ import traceback
 from pathlib import Path
 from typing import Any
 
+from tbbcc_metrics import calc_ar, confidence_interval, migrate_at_k, summarize_effort_ledger, summarize_suite_effort
+
 
 FAILURE_CLASSES = {
     "EnvironmentFailure",
@@ -157,6 +159,80 @@ def load_adapter(path: Path) -> AdapterSpec:
         dtw_threshold=_optional_float(data.get("dtw_threshold")),
         source_path=str(path),
     )
+
+
+def load_effort_ledger(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {
+            "entries": [],
+            "baseline_effort": None,
+        }
+    data = _load_json(path)
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        raise SystemExit(f"Effort ledger {path} must contain an entries array")
+    return {
+        "entries": entries,
+        "reroll_entries": data.get("reroll_entries") or entries,
+        "baseline_effort": data.get("baseline_effort"),
+        "migration_samples": data.get("migration_samples") or data.get("samples") or [],
+    }
+
+
+def load_ar_baseline(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    data = _load_json(path)
+    if data.get("baseline_effort") is None:
+        raise SystemExit(f"AR baseline {path} missing baseline_effort")
+    if str(data.get("effort_formula_version") or "") != "shared-effort-v1":
+        raise SystemExit(f"AR baseline {path} has unsupported effort_formula_version: {data.get('effort_formula_version')}")
+    data = dict(data)
+    data["source_path"] = str(path)
+    return data
+
+
+_CURRENT_EFFORT_LEDGER: dict[str, Any] = {
+    "entries": [],
+    "baseline_effort": None,
+    "source_path": None,
+    "baseline_metadata": None,
+}
+
+
+def set_current_effort_ledger(ledger: dict[str, Any]) -> None:
+    global _CURRENT_EFFORT_LEDGER
+    _CURRENT_EFFORT_LEDGER = ledger
+
+
+def build_effort_ledger(case: TestCase, adapter: AdapterSpec) -> dict[str, Any]:
+    entries = []
+    for entry in _CURRENT_EFFORT_LEDGER.get("entries", []):
+        entry_case = entry.get("case_id")
+        entry_bridge = entry.get("bridge_id")
+        if entry_case not in (None, case.id):
+            continue
+        if entry_bridge not in (None, adapter.bridge_id):
+            continue
+        entries.append(entry)
+    return {
+        "entries": entries,
+        "baseline_effort": _CURRENT_EFFORT_LEDGER.get("baseline_effort"),
+        "source_path": _CURRENT_EFFORT_LEDGER.get("source_path"),
+        "baseline_metadata": _CURRENT_EFFORT_LEDGER.get("baseline_metadata"),
+    }
+
+
+def prepare_effort_context(effort_ledger_path: str | None, ar_baseline_path: str | None) -> dict[str, Any]:
+    ledger = load_effort_ledger(Path(effort_ledger_path)) if effort_ledger_path else load_effort_ledger(None)
+    if effort_ledger_path:
+        ledger["source_path"] = str(Path(effort_ledger_path).resolve())
+    baseline = load_ar_baseline(Path(ar_baseline_path)) if ar_baseline_path else None
+    if baseline is not None:
+        ledger["baseline_effort"] = baseline["baseline_effort"]
+        ledger["baseline_metadata"] = baseline
+    ledger.setdefault("migration_samples", [])
+    return ledger
 
 
 def _optional_float(value: Any) -> float | None:
@@ -761,6 +837,34 @@ def build_report(case: TestCase, adapter: AdapterSpec, source: ExecResult, targe
         not t3_result.get("implemented") or bool(t3_result.get("passed"))
     )
     final_state = "ALL_PASS" if source.ok and target.ok and implemented_tiers_passed else "MARK_UNFIXABLE"
+    effort_ledger = build_effort_ledger(case, adapter)
+    effort = summarize_effort_ledger(
+        effort_ledger.get("entries", []),
+        baseline_effort=effort_ledger.get("baseline_effort"),
+        baseline_metadata=effort_ledger.get("baseline_metadata"),
+    )
+    if not effort_ledger.get("entries"):
+        effort["effort_adapt"] = 0.0
+        effort["effort_repair"] = 0.0
+        effort["effort_total"] = 0.0
+        effort["me"] = 0.0
+        effort["ar"] = calc_ar(0.0, effort_ledger.get("baseline_effort"))
+        effort["source"] = "deterministic_no_agent"
+        effort["repair_attempts"] = 0
+    effort["confidence_interval"] = confidence_interval([effort["effort_total"] or 0.0])
+    effort["migrate_at_k"] = migrate_at_k(
+        [
+            {
+                "case_id": case.id,
+                "task_id": case.id,
+                "reroll_index": 1,
+                "final_state": "ALL_PASS" if source.ok and target.ok and comparison.get("passed") else "MARK_UNFIXABLE",
+                "exec_passed": bool(source.ok and target.ok and comparison.get("passed")),
+                "full_passed": bool(source.ok and target.ok and comparison.get("passed")),
+                "all_tiers_passed": bool(source.ok and target.ok and comparison.get("passed")),
+            }
+        ]
+    )
     return {
         "schema_version": "tbbcc.report.v0.1",
         "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
@@ -791,11 +895,7 @@ def build_report(case: TestCase, adapter: AdapterSpec, source: ExecResult, targe
             },
         },
         "effort": {
-            "effort_adapt": None,
-            "effort_repair": None,
-            "effort_total": None,
-            "repair_attempts": 0,
-            "note": "Agent effort accounting is reserved for the Claude Code workflow layer.",
+            **effort,
         },
     }
 
@@ -856,6 +956,66 @@ def write_suite_summary(summary: dict[str, Any], out_dir: Path) -> tuple[Path, P
     return json_path, md_path
 
 
+def _safe_mean(values: list[float]) -> float | None:
+    return statistics.mean(values) if values else None
+
+
+def _safe_max(values: list[float]) -> float | None:
+    return max(values) if values else None
+
+
+def _safe_min(values: list[float]) -> float | None:
+    return min(values) if values else None
+
+
+def summarize_quality_metrics(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    counted = [run for run in runs if run.get("counts_toward_compatibility")]
+    passed = [run for run in counted if run.get("final_state") == "ALL_PASS"]
+    first_passed = [run for run in passed if int(run.get("repair_attempts") or 0) == 0]
+    t1 = [run.get("t1_metrics") or {} for run in runs]
+    timing = [run.get("timing") or {} for run in runs]
+    source_durations = [float(item["source_duration_seconds"]) for item in timing if item.get("source_duration_seconds") is not None]
+    target_durations = [float(item["target_duration_seconds"]) for item in timing if item.get("target_duration_seconds") is not None]
+    combined_durations = [float(run["duration_seconds"]) for run in runs if run.get("duration_seconds") is not None]
+    ratios = []
+    for item in timing:
+        source = item.get("source_duration_seconds")
+        target = item.get("target_duration_seconds")
+        if source not in (None, 0) and target is not None:
+            ratios.append(float(target) / float(source))
+    t2_implemented = [run for run in runs if run.get("t2_implemented")]
+    t2_passed = [run for run in t2_implemented if run.get("t2_passed") is True]
+    t3_implemented = [run for run in runs if run.get("t3_implemented")]
+    t3_passed = [run for run in t3_implemented if run.get("t3_passed") is True]
+    return {
+        "compatibility_rate": (len(passed) / len(counted)) if counted else None,
+        "first_pass_rate": (len(first_passed) / len(counted)) if counted else None,
+        "first_passed": len(first_passed),
+        "compatibility_counted_total": len(counted),
+        "numeric": {
+            "mean_mae": _safe_mean([float(item["mae"]) for item in t1 if item.get("mae") is not None]),
+            "max_p95": _safe_max([float(item["p95"]) for item in t1 if item.get("p95") is not None]),
+            "max_error": _safe_max([float(item["max_error"]) for item in t1 if item.get("max_error") is not None]),
+            "min_cosine": _safe_min([float(item["cosine"]) for item in t1 if item.get("cosine") is not None]),
+            "failed_count": sum(int(item.get("failed_count") or 0) for item in t1),
+        },
+        "performance": {
+            "mean_source_seconds": _safe_mean(source_durations),
+            "mean_target_seconds": _safe_mean(target_durations),
+            "mean_wall_seconds": _safe_mean(combined_durations),
+            "target_source_ratio_mean": _safe_mean(ratios),
+            "target_source_ratio_max": _safe_max(ratios),
+        },
+        "tiers": {
+            "t1_pass_rate": (len([run for run in runs if run.get("t1_passed") is True]) / len(runs)) if runs else None,
+            "t2_implemented": len(t2_implemented),
+            "t2_pass_rate_when_implemented": (len(t2_passed) / len(t2_implemented)) if t2_implemented else None,
+            "t3_implemented": len(t3_implemented),
+            "t3_pass_rate_when_implemented": (len(t3_passed) / len(t3_implemented)) if t3_implemented else None,
+        },
+    }
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     t1 = report["tiers"]["T1"]
     t2 = report["tiers"]["T2"]
@@ -863,6 +1023,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     metrics = t1["metrics"]
     cls = t1["auto_classification"]
     timing = report.get("timing") or {}
+    effort = report.get("effort") or {}
     lines = [
         "# TorchBridgeBench Report",
         "",
@@ -873,6 +1034,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- Failure class: `{cls['class']}`",
         f"- Counts toward compatibility: `{cls['counts_toward_compatibility']}`",
         f"- Combined execution seconds: `{timing.get('combined_execution_seconds')}`",
+        f"- ME: `{effort.get('me')}`",
+        f"- AR: `{effort.get('ar')}`",
+        f"- Effort source: `{effort.get('source')}`",
         "",
         "## Tier-1 Metrics",
         "",
@@ -911,6 +1075,24 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(f"- {item}")
     if report["tiers"]["T1"]["target"].get("traceback"):
         lines.extend(["", "## Target Traceback", "", "```text", report["tiers"]["T1"]["target"]["traceback"], "```"])
+    lines.extend(["", "## Effort Metrics", ""])
+    for key in ["effort_adapt", "effort_repair", "effort_total", "baseline_effort", "repair_attempts"]:
+        lines.append(f"- {key}: `{effort.get(key)}`")
+    baseline_meta = effort.get("baseline_metadata") or {}
+    if baseline_meta:
+        lines.append(f"- baseline model: `{baseline_meta.get('model')}`")
+        lines.append(f"- baseline protocol: `{baseline_meta.get('protocol')}`")
+        lines.append(f"- baseline task digest: `{baseline_meta.get('task_set_digest')}`")
+    ci = effort.get("confidence_interval") or {}
+    lines.append(f"- effort 95% CI: `{ci.get('low')}` to `{ci.get('high')}`")
+    migrate = effort.get("migrate_at_k") or {}
+    full = migrate.get("full") or {}
+    exec_only = migrate.get("exec") or {}
+    for key in ["migrate@1", "migrate@3", "migrate@5", "migrate@10"]:
+        if key in full:
+            lines.append(f"- {key}_full: `{full[key].get('rate')}`")
+        if key in exec_only:
+            lines.append(f"- {key}_exec: `{exec_only[key].get('rate')}`")
     lines.extend(
         [
             "",
@@ -918,7 +1100,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "- Tier-2 is implemented when a case exposes ACTIVATIONS or GRADIENTS.",
             "- Tier-3 is implemented when a case exposes TASK_METRICS.",
-            "- Agent effort accounting is handled by the Claude Code workflow layer.",
+            "- Agent effort is read from an optional effort ledger; deterministic runs without a ledger record zero agent effort.",
             "",
         ]
     )
@@ -931,18 +1113,48 @@ def render_suite_markdown(summary: dict[str, Any]) -> str:
     raw_pass_rate = totals.get("raw_pass_rate")
     compatibility_text = "n/a" if compatibility_rate is None else f"{compatibility_rate:.4f}"
     raw_pass_text = "n/a" if raw_pass_rate is None else f"{raw_pass_rate:.4f}"
+    reroll_ci = (summary.get("effort") or {}).get("reroll_effort_confidence_interval") or {}
+    run_ci = (summary.get("effort") or {}).get("run_effort_confidence_interval") or {}
+    ar_ci = (summary.get("effort") or {}).get("ar_confidence_interval") or {}
+    scope_ar_ci = (summary.get("effort") or {}).get("scope_adjusted_ar_confidence_interval") or {}
+    migrate = (summary.get("effort") or {}).get("migrate_at_k") or {}
+    effort_summary = summary.get("effort") or {}
+    baseline_meta = effort_summary.get("baseline_metadata") or {}
+    baseline_scope = effort_summary.get("baseline_scope") or {}
+    variance = effort_summary.get("variance_control") or {}
+    quality = summary.get("quality") or {}
+    numeric = quality.get("numeric") or {}
+    performance = quality.get("performance") or {}
+    tiers = quality.get("tiers") or {}
+    migrate_exec_1 = (((migrate.get("exec") or {}).get("migrate@1") or {}).get("rate"))
+    migrate_full_1 = (((migrate.get("full") or {}).get("migrate@1") or {}).get("rate"))
     lines = [
         "# TorchBridgeBench Suite Summary",
         "",
-        f"- Suite: `{summary['suite_id']}`",
-        f"- Total runs: `{totals['total']}`",
-        f"- Passed: `{totals['passed']}`",
-        f"- Failed: `{totals['failed']}`",
-        f"- Compatibility-counted runs: `{totals.get('compatibility_counted_total')}`",
-        f"- Compatibility-counted passes: `{totals.get('compatibility_counted_passed')}`",
-        f"- Compatibility rate: `{compatibility_text}`",
-        f"- Raw pass rate: `{raw_pass_text}`",
-        f"- Total duration seconds: `{totals.get('duration_seconds')}`",
+        f"Suite `{summary['suite_id']}` finished `{totals['passed']}/{totals['total']}` runs. "
+        "Compatibility excludes environment/configuration-only failures.",
+        "",
+        "## Key Metrics",
+        "",
+        "| Metric | Value | Meaning |",
+        "| --- | ---: | --- |",
+        f"| Compatibility rate | `{compatibility_text}` | Bridge-relevant pass rate after excluding environment noise. |",
+        f"| First-pass rate | `{quality.get('first_pass_rate')}` | Passed without counted repair effort. |",
+        f"| Raw pass rate | `{raw_pass_text}` | All runs passed divided by all runs. |",
+        f"| ME | `{effort_summary.get('me')}` | Total counted migration effort: adapt + repair. |",
+        f"| AR | `{effort_summary.get('ar')}` | Work avoided versus calibrated no-bridge baseline. |",
+        f"| Scope-adjusted AR | `{effort_summary.get('scope_adjusted_ar')}` | Subset-only diagnostic when not running the full baseline task set. |",
+        f"| Effort_adapt / Effort_repair | `{effort_summary.get('effort_adapt')}` / `{effort_summary.get('effort_repair')}` | Agent work split by design phase. |",
+        f"| Repair attempts | `{effort_summary.get('repair_attempts')}` | Counted repair attempts; environment remediation is excluded. |",
+        f"| Numeric max error | `{numeric.get('max_error')}` | Worst Tier-1 numeric deviation. |",
+        f"| Numeric mean MAE | `{numeric.get('mean_mae')}` | Mean absolute error across runs. |",
+        f"| Numeric min cosine | `{numeric.get('min_cosine')}` | Worst cosine similarity across runs. |",
+        f"| Mean wall seconds | `{performance.get('mean_wall_seconds')}` | Average end-to-end run time. |",
+        f"| Target/source time ratio | `{performance.get('target_source_ratio_mean')}` | Mean target execution time divided by source time. |",
+        f"| T2 pass rate | `{tiers.get('t2_pass_rate_when_implemented')}` | Activation/gradient pass rate where implemented. |",
+        f"| T3 pass rate | `{tiers.get('t3_pass_rate_when_implemented')}` | Task-metric pass rate where implemented. |",
+        f"| migrate@1 exec/full | `{migrate_exec_1}` / `{migrate_full_1}` | One reroll succeeds at T1 / all enabled tiers. |",
+        f"| Reroll CV | `{variance.get('cv')}` | Stability of agent-related effort samples. |",
         "",
         "## Executive Summary",
         "",
@@ -958,8 +1170,65 @@ def render_suite_markdown(summary: dict[str, Any]) -> str:
         lines.append(f"- Most frequent failure class: `{top_failure[0]}` x `{top_failure[1]}`.")
     else:
         lines.append("- No failure classes were recorded.")
+    if baseline_scope:
+        lines.append(
+            f"- AR baseline scope: evaluated `{baseline_scope.get('evaluated_case_count')}` cases, "
+            f"baseline has `{baseline_scope.get('baseline_case_count')}` cases, "
+            f"policy=`{baseline_scope.get('baseline_scaling_policy')}`. "
+            "The primary AR above always uses the calibrated full baseline; scope-adjusted AR is a subset-only diagnostic."
+        )
+    if variance:
+        lines.append(
+            f"- Reroll stability: cv=`{variance.get('cv')}`, needs_more_samples=`{variance.get('needs_more_samples')}`."
+        )
+    lines.append(
+        f"- Performance summary: mean wall=`{performance.get('mean_wall_seconds')}`s, "
+        f"target/source ratio mean=`{performance.get('target_source_ratio_mean')}`."
+    )
+    lines.append(
+        f"- Numeric summary: max_error=`{numeric.get('max_error')}`, "
+        f"mean_mae=`{numeric.get('mean_mae')}`, failed_count=`{numeric.get('failed_count')}`."
+    )
     lines.extend(
         [
+            "",
+            "## Paper-Ready Values",
+            "",
+            f"- Compatibility rate: `{compatibility_text}`",
+            f"- First-pass rate: `{quality.get('first_pass_rate')}`",
+            f"- ME / AR: `{effort_summary.get('me')}` / `{effort_summary.get('ar')}`",
+            f"- Numeric consistency: max_error=`{numeric.get('max_error')}`, min_cosine=`{numeric.get('min_cosine')}`",
+            f"- Performance: mean_wall_seconds=`{performance.get('mean_wall_seconds')}`, target_source_ratio_mean=`{performance.get('target_source_ratio_mean')}`",
+            f"- migrate@1_exec/full: `{migrate_exec_1}` / `{migrate_full_1}`",
+        ]
+    )
+    if baseline_meta:
+        lines.extend(["", "## AR Baseline", ""])
+        lines.append(f"- model: `{baseline_meta.get('model')}`")
+        lines.append(f"- observed model: `{baseline_meta.get('model_observed')}`")
+        lines.append(f"- provider: `{baseline_meta.get('provider')}`")
+        lines.append(f"- protocol: `{baseline_meta.get('protocol')}`")
+        lines.append(f"- agent system: `{baseline_meta.get('agent_system')}`")
+        lines.append(f"- agent system version: `{baseline_meta.get('agent_system_version')}`")
+        lines.append(f"- effort formula version: `{baseline_meta.get('effort_formula_version')}`")
+        lines.append(f"- task set digest: `{baseline_meta.get('task_set_digest')}`")
+    lines.extend(["", "## Migrate@k", ""])
+    for mode, label in [("exec", "exec only"), ("full", "full tiers")]:
+        mode_data = migrate.get(mode) or {}
+        for key in ["migrate@1", "migrate@3", "migrate@5", "migrate@10"]:
+            if key in mode_data:
+                lines.append(f"- {key} ({label}): `{mode_data[key].get('rate')}`")
+        if "saturation_k" in mode_data:
+            lines.append(f"- saturation_k ({label}): `{mode_data.get('saturation_k')}`")
+    lines.extend(
+        [
+            "",
+            "## Effort Detail",
+            "",
+            f"- Run-level effort mean: `{run_ci.get('mean')}`",
+            f"- Run-level effort 95% CI: `{run_ci.get('low')}` to `{run_ci.get('high')}`",
+            f"- Effort source: `{effort_summary.get('source')}`",
+            f"- Ledger path: `{effort_summary.get('ledger_path')}`",
             "",
             "## Failure Classes",
             "",
@@ -1019,6 +1288,8 @@ def run_eval(case_path: Path, adapter_path: Path, out_dir: Path, timeout_overrid
 
 
 def cmd_eval(args: argparse.Namespace) -> int:
+    ledger = prepare_effort_context(args.effort_ledger, args.ar_baseline)
+    set_current_effort_ledger(ledger)
     report = run_eval(
         Path(args.case),
         Path(args.adapter),
@@ -1033,6 +1304,8 @@ def cmd_eval(args: argparse.Namespace) -> int:
 
 
 def cmd_eval_suite(args: argparse.Namespace) -> int:
+    ledger = prepare_effort_context(args.effort_ledger, args.ar_baseline)
+    set_current_effort_ledger(ledger)
     suite_started = _dt.datetime.now(_dt.UTC)
     suite_path = Path(args.suite).resolve()
     suite = _load_json(suite_path)
@@ -1051,6 +1324,7 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
     failed = 0
     compatibility_total = 0
     compatibility_passed = 0
+    migration_samples: list[dict[str, Any]] = []
     for case_item in cases:
         case_path = _resolve_path(base, str(case_item))
         case_obj = load_case(case_path)
@@ -1070,6 +1344,19 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
             cls = report["tiers"]["T1"]["auto_classification"]["class"]
             counts_toward_compatibility = report["tiers"]["T1"]["auto_classification"]["counts_toward_compatibility"]
             run_duration = report.get("timing", {}).get("wall_clock_seconds")
+            effort = report.get("effort", {})
+            migration_samples.append(
+                {
+                    "case_id": case_obj.id,
+                    "task_id": case_obj.id,
+                    "bridge_id": adapter_obj.bridge_id,
+                    "reroll_index": 1,
+                    "final_state": report["final_state"],
+                    "exec_passed": bool(report.get("tiers", {}).get("T1", {}).get("passed")),
+                    "full_passed": report["final_state"] == "ALL_PASS",
+                    "all_tiers_passed": report["final_state"] == "ALL_PASS",
+                }
+            )
             if report["final_state"] == "ALL_PASS":
                 passed += 1
                 if counts_toward_compatibility:
@@ -1091,10 +1378,34 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
                     "report_md": paths["report_md"],
                     "counts_toward_compatibility": counts_toward_compatibility,
                     "duration_seconds": run_duration,
+                    "timing": report.get("timing", {}),
+                    "t1_passed": report.get("tiers", {}).get("T1", {}).get("passed"),
+                    "t1_metrics": report.get("tiers", {}).get("T1", {}).get("metrics", {}),
+                    "t2_implemented": report.get("tiers", {}).get("T2", {}).get("implemented"),
+                    "t2_passed": report.get("tiers", {}).get("T2", {}).get("passed"),
+                    "t3_implemented": report.get("tiers", {}).get("T3", {}).get("implemented"),
+                    "t3_passed": report.get("tiers", {}).get("T3", {}).get("passed"),
+                    "effort_total": effort.get("effort_total"),
+                    "effort_adapt": effort.get("effort_adapt"),
+                    "effort_repair": effort.get("effort_repair"),
+                    "repair_attempts": effort.get("repair_attempts"),
+                    "ar": effort.get("ar"),
                 }
             )
     total = passed + failed
     suite_duration = (_dt.datetime.now(_dt.UTC) - suite_started).total_seconds()
+    ledger_migration_samples = ledger.get("migration_samples") or []
+    migrate_samples = ledger_migration_samples if ledger_migration_samples else migration_samples
+    suite_effort = summarize_suite_effort(
+        runs,
+        ledger.get("entries", []),
+        reroll_entries=ledger.get("reroll_entries"),
+        baseline_effort=ledger.get("baseline_effort"),
+        baseline_metadata=ledger.get("baseline_metadata"),
+        evaluated_case_ids=[run["case_id"] for run in runs],
+    )
+    suite_effort["ledger_path"] = ledger.get("source_path")
+    suite_effort["migrate_at_k"] = migrate_at_k(migrate_samples)
     summary = {
         "schema_version": "tbbcc.suite.v0.1",
         "suite_id": suite_id,
@@ -1110,6 +1421,8 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
             "raw_pass_rate": (passed / total) if total else 0.0,
             "duration_seconds": suite_duration,
         },
+        "effort": suite_effort,
+        "quality": summarize_quality_metrics(runs),
         "failure_classes": failure_classes,
         "runs": runs,
     }
@@ -1153,6 +1466,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--timeout", type=int, default=None, help="Override timeout seconds")
     p_eval.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
     p_eval.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
+    p_eval.add_argument("--effort-ledger", default=None, help="Path to optional effort ledger JSON")
+    p_eval.add_argument("--ar-baseline", default=None, help="Path to AR baseline.json calibration artifact")
     p_eval.set_defaults(func=cmd_eval)
 
     p_suite = sub.add_parser("eval-suite", help="Run a benchmark suite matrix")
@@ -1161,6 +1476,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_suite.add_argument("--timeout", type=int, default=None, help="Override timeout seconds")
     p_suite.add_argument("--atol", type=float, default=None, help="Override absolute tolerance")
     p_suite.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
+    p_suite.add_argument("--effort-ledger", default=None, help="Path to optional effort ledger JSON")
+    p_suite.add_argument("--ar-baseline", default=None, help="Path to AR baseline.json calibration artifact")
     p_suite.set_defaults(func=cmd_eval_suite)
 
     p_validate = sub.add_parser("validate-inputs", help="Validate case and adapter JSON files")

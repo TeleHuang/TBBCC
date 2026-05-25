@@ -100,10 +100,50 @@ python scripts/tbbcc.py eval-suite \
   --out reports/bench_dev_noop
 ```
 
+## AR Baseline Calibration
+
+The AR constant is model- and agent-system-specific. For the Claude Code
+baseline with DeepSeek pro, use the bundled `ar-baseline` skill or run:
+
+```bash
+python scripts/calibrate_ar_cc.py \
+  --suite benchmarks/v1.0.0/suites/all_noop.json \
+  --out reports/ar_baseline/deepseek-v4-pro-cc-v1 \
+  --rerolls 1 \
+  --workers 1 \
+  --model 'deepseek-v4-pro[1m]'
+```
+
+Outputs are written under the selected report directory:
+
+- `samples.jsonl`: raw per-case Claude Code samples and usage metadata.
+- `baseline.json`: the baseline constant and audit metadata.
+- `baseline.md`: a short human-readable summary.
+
+Rerun the same command to resume an interrupted calibration. The expected full
+pass covers all 175 generated cases. Use `--rerolls 2` or higher when you need a
+variance estimate rather than a single exhaustive pass.
+
 ## Output
 
 Benchmark runs write JSON and Markdown reports into the output directory you
 choose. Suite runs also write a summary file under `runs/`.
+
+For bridge developers, start with
+`references/bridge-developer-quickstart.md`. It explains how to run a suite and
+which report fields are paper-ready: compatibility rate, first-pass rate,
+numeric consistency, performance, ME, AR, effort split, migrate@k, and reroll
+stability.
+
+In Claude Code TUI, the easiest end-to-end entrypoint is the `/eval` slash
+command:
+
+```text
+/eval --bridge-id <id> --docs <bridge-docs.md> --suite benchmarks/v1.0.0/suites/smoke_noop.json --out reports/<id>_eval
+```
+
+This command starts from adapter authoring, writes `adapter.generated.json` and
+`effort_ledger.json`, runs the suite, then returns the generated report paths.
 
 ## Versioning
 
@@ -117,9 +157,11 @@ Current release baseline: `0.1.0`.
 .claude-plugin/plugin.json       Plugin manifest
 commands/                        Slash commands
 skills/                          Skill-based workflows
+skills/ar-baseline/SKILL.md      AR baseline calibration workflow
 agents/                          Specialist agent prompts
 references/                      Design and runtime notes
 scripts/tbbcc.py                 Deterministic benchmark core
+scripts/calibrate_ar_cc.py       Claude Code AR baseline calibrator
 scripts/generate_benchmark_library.py
                                  Benchmark library generator
 benchmarks/                      Generated static benchmark catalog

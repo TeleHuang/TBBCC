@@ -63,13 +63,19 @@ Claude Code agents represent the migration user. They may:
 They should not silently patch bridge internals. Bridge fixes belong to a
 different project.
 
+The convenient Track A entrypoint in Claude Code TUI is `/eval`. It starts from
+bridge documentation, writes `adapter.generated.json`, records `Effort_adapt`,
+creates a suite pointing at that generated adapter, and then runs the benchmark
+report path.
+
 Current implementation status:
 
+- `agents/adapter-author.md` models adapter generation from bridge docs.
 - `agents/diagnostician.md` models the independent confirmation role.
 - `agents/repairer.md` models user-side repair only.
-- The plugin does not yet automate the full end-to-end state machine with stored
-  `AgentContext`, MC repair sampling, or baseline effort scoring inside the core
-  CLI.
+- The plugin does not yet automate the full repair state machine with stored
+  `AgentContext` inside the core CLI; that orchestration is handled by Claude
+  Code slash-command workflow.
 
 ## Dual-System Plan
 

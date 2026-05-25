@@ -11,6 +11,16 @@ the local core.
 
 Effort here counts as `effort_adapt`.
 
+In Claude Code TUI, the intended Track A entrypoint is:
+
+```text
+/eval --bridge-id <id> --docs <bridge-docs.md> --suite <suite.json> --out <out-dir>
+```
+
+That command starts with adapter authoring, writes `adapter.generated.json`,
+records an `adapt` ledger entry, generates a suite pointing to the adapter, and
+then invokes the deterministic core.
+
 ## Phase 1: Deterministic Verification
 
 Run the core:
@@ -46,9 +56,10 @@ After every repair, rerun from Tier-1.
 
 Current limitation:
 
-- The plugin defines evaluator / diagnostician / repairer roles and the report
-  schema placeholders for effort, but the full repair loop is still orchestrated
-  manually by the Claude Code workflow rather than by `scripts/tbbcc.py`.
+- The deterministic core consumes an effort ledger and reports ME, AR,
+  migrate@k, and reroll stability. The full repair loop is still orchestrated by
+  the Claude Code workflow rather than by `scripts/tbbcc.py`. Adapter authoring
+  is exposed through the `/eval` Claude Code slash command.
 
 ## Stop Conditions
 
