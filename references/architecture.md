@@ -63,10 +63,13 @@ Claude Code agents represent the migration user. They may:
 They should not silently patch bridge internals. Bridge fixes belong to a
 different project.
 
-The convenient Track A entrypoint in Claude Code TUI is `/eval`. It starts from
-bridge documentation, writes `adapter.generated.json`, records `Effort_adapt`,
-creates a suite pointing at that generated adapter, and then runs the benchmark
-report path.
+The convenient Track A entrypoint in Claude Code TUI is
+`/torchbridgebench:eval`. It accepts a natural-language request, searches local
+bridge repositories for documentation or minimal examples, writes
+`adapter.generated.json`, records `Effort_adapt`, creates a suite pointing at
+that generated adapter, and then runs the benchmark report path. When
+documentation is unavailable, a local minimal example is sufficient evidence for
+adapter generation; if neither is found, the workflow asks the user for one.
 
 Current implementation status:
 

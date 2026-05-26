@@ -11,15 +11,19 @@ the local core.
 
 Effort here counts as `effort_adapt`.
 
-In Claude Code TUI, the intended Track A entrypoint is:
+In Claude Code TUI, the intended Track A entrypoint is the plugin namespaced
+slash command:
 
 ```text
-/eval --bridge-id <id> --docs <bridge-docs.md> --suite <suite.json> --out <out-dir>
+/torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，输出到 reports/torch4ms_eval
 ```
 
-That command starts with adapter authoring, writes `adapter.generated.json`,
-records an `adapt` ledger entry, generates a suite pointing to the adapter, and
-then invokes the deterministic core.
+That command accepts natural language. It should infer the bridge id, search
+local bridge repositories, docs, examples, and minimal tests, then start with
+adapter authoring. It writes `adapter.generated.json`, records an `adapt` ledger
+entry, generates a suite pointing to the adapter, and invokes the deterministic
+core. If no docs or minimal examples can be found, it asks the user for one of
+those inputs instead of failing on a missing placeholder path.
 
 ## Phase 1: Deterministic Verification
 
@@ -35,6 +39,12 @@ Current core behavior:
 - Tier-2 runs when either side emits `ACTIVATIONS` or `GRADIENTS`.
 - Tier-3 runs when either side emits `TASK_METRICS`.
 - On the pass path, the ordering is T1 -> T2 -> T3.
+
+If verification fails because a bridge package is missing, the workflow must
+attempt environment remediation before final classification. Examples include
+checking activation scripts, local source checkouts, `PYTHONPATH`, and working
+directory assumptions. This remediation is not counted as `effort_adapt` or
+`effort_repair`.
 
 ## Phase 2: Classification
 
@@ -59,7 +69,8 @@ Current limitation:
 - The deterministic core consumes an effort ledger and reports ME, AR,
   migrate@k, and reroll stability. The full repair loop is still orchestrated by
   the Claude Code workflow rather than by `scripts/tbbcc.py`. Adapter authoring
-  is exposed through the `/eval` Claude Code slash command.
+  is exposed through the `/torchbridgebench:eval` Claude Code plugin slash
+  command.
 
 ## Stop Conditions
 

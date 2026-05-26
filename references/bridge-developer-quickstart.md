@@ -18,23 +18,27 @@ performance, ME, AR, effort split, migrate@k, and reroll stability.
 
 ## One-Command Automatic Run
 
-In Claude Code TUI, use `/eval` when you want the system to start from adapter
-authoring:
+In Claude Code TUI, use `/torchbridgebench:eval` when you want the system to
+start from adapter authoring. Prefer natural language over CLI-style flags:
 
 ```text
-/eval --bridge-id your_bridge --docs path/to/bridge_docs.md --suite benchmarks/v1.0.0/suites/smoke_noop.json --out reports/your_bridge_eval
+/torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，输出到 reports/torch4ms_eval
 ```
 
-This command reads the bridge docs, writes:
+The agent infers the bridge id, searches local bridge repositories, README/docs,
+examples, and `test_*.py` minimal cases, then writes:
 
-- `reports/your_bridge_eval/adapter.generated.json`
-- `reports/your_bridge_eval/effort_ledger.json`
-- `reports/your_bridge_eval/suite.generated.json`
-- `reports/your_bridge_eval/eval/summary.md`
-- `reports/your_bridge_eval/eval/summary.json`
+- `reports/torch4ms_eval/adapter.generated.json`
+- `reports/torch4ms_eval/effort_ledger.json`
+- `reports/torch4ms_eval/suite.generated.json`
+- `reports/torch4ms_eval/eval/summary.md`
+- `reports/torch4ms_eval/eval/summary.json`
 
 Use this path for normal bridge evaluation. It records adapter creation as
 `Effort_adapt` and then runs the generated adapter through the benchmark suite.
+If documentation is missing but a minimal example exists, the agent should use
+the example as adapter evidence. If neither exists, it should ask for a minimal
+example, local docs, or online docs.
 
 ## Manual Run
 

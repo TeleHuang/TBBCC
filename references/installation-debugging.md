@@ -11,9 +11,20 @@ claude --plugin-dir /home/ma-user/work/torchbridgebenchCCplugin
 Inside Claude Code:
 
 ```text
-/torchbridgebench-inspect
-/torchbridgebench --case examples/cases/pure_python_vector.json --adapter examples/adapters/noop.json --out reports/smoke
+/torchbridgebench:torchbridgebench-inspect
 /reload-plugins
+```
+
+Run `/reload-plugins` after editing command or skill files in an already-open
+TUI window. Without reload, Claude Code may keep using the old command prompt.
+
+Run deterministic smoke checks from a shell:
+
+```bash
+python scripts/tbbcc.py eval \
+  --case examples/cases/pure_python_vector.json \
+  --adapter examples/adapters/noop.json \
+  --out reports/smoke
 ```
 
 ## Validation

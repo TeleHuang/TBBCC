@@ -20,22 +20,30 @@ Inside Claude Code, reload plugins:
 /reload-plugins
 ```
 
+After editing command or skill files, reload before testing the same TUI window.
+Otherwise Claude Code may continue using the previously loaded prompt.
+
 Confirm the plugin is loaded:
 
 ```text
-/torchbridgebench-inspect
+/torchbridgebench:torchbridgebench-inspect
 ```
 
 Run a single smoke case:
 
-```text
-/torchbridgebench --case examples/cases/pure_python_vector.json --adapter examples/adapters/noop.json --out reports/smoke
+```bash
+python scripts/tbbcc.py eval \
+  --case examples/cases/pure_python_vector.json \
+  --adapter examples/adapters/noop.json \
+  --out reports/smoke
 ```
 
 Or run the bundled cross-level smoke suite:
 
-```text
-/torchbridgebench --suite benchmarks/v1.0.0/suites/smoke_noop.json --out reports/bench_smoke
+```bash
+python scripts/tbbcc.py eval-suite \
+  --suite benchmarks/v1.0.0/suites/smoke_noop.json \
+  --out reports/bench_smoke
 ```
 
 ## What You Get
@@ -135,15 +143,19 @@ which report fields are paper-ready: compatibility rate, first-pass rate,
 numeric consistency, performance, ME, AR, effort split, migrate@k, and reroll
 stability.
 
-In Claude Code TUI, the easiest end-to-end entrypoint is the `/eval` slash
-command:
+In Claude Code TUI, the easiest end-to-end entrypoint is the plugin namespaced
+slash command `/torchbridgebench:eval`. Use natural language first; the agent
+will search local bridge repositories, docs, examples, and minimal tests before
+asking for missing input:
 
 ```text
-/eval --bridge-id <id> --docs <bridge-docs.md> --suite benchmarks/v1.0.0/suites/smoke_noop.json --out reports/<id>_eval
+/torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，输出到 reports/torch4ms_eval
 ```
 
 This command starts from adapter authoring, writes `adapter.generated.json` and
 `effort_ledger.json`, runs the suite, then returns the generated report paths.
+If documentation is unavailable, a local minimal example such as `test_*.py` is
+acceptable evidence for adapter generation.
 
 ## Versioning
 
