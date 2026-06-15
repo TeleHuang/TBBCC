@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from tbbcc_metrics import calc_ar, confidence_interval, migrate_at_k, summarize_effort_ledger, summarize_suite_effort
+from tbbcc_report_plots import generate_report_plots
 
 
 FAILURE_CLASSES = {
@@ -1455,6 +1456,21 @@ def cmd_inspect_env(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plot_reports(args: argparse.Namespace) -> int:
+    kinds = []
+    if args.failure_taxonomy:
+        kinds.append("failure-taxonomy")
+    if args.compatibility_overview:
+        kinds.append("compatibility-overview")
+    result = generate_report_plots(
+        [Path(item) for item in args.summary],
+        Path(args.out).resolve(),
+        kinds=kinds or None,
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tbbcc", description="TorchBridgeBench Claude Code plugin core")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1492,6 +1508,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Import modules to read __version__. Slower and may initialize heavy frameworks.",
     )
     p_env.set_defaults(func=cmd_inspect_env)
+
+    p_plot = sub.add_parser(
+        "plot-reports",
+        help="Generate optional compatibility-analysis figures from summary.json reports",
+    )
+    p_plot.add_argument(
+        "--summary",
+        action="append",
+        required=True,
+        help="Path to a TorchBridgeBench or eval-migration summary.json. Repeat for comparisons.",
+    )
+    p_plot.add_argument("--out", required=True, help="Output directory for PDF/PNG figures")
+    p_plot.add_argument(
+        "--failure-taxonomy",
+        action="store_true",
+        help="Generate stacked failure-class distribution figure",
+    )
+    p_plot.add_argument(
+        "--compatibility-overview",
+        action="store_true",
+        help="Generate compatibility-vs-raw-pass overview figure",
+    )
+    p_plot.set_defaults(func=cmd_plot_reports)
     return parser
 
 

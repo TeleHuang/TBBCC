@@ -157,6 +157,19 @@ This command starts from adapter authoring, writes `adapter.generated.json` and
 If documentation is unavailable, a local minimal example such as `test_*.py` is
 acceptable evidence for adapter generation.
 
+Optional compatibility-analysis figures can be generated from one or more
+summary reports:
+
+```bash
+python scripts/tbbcc.py plot-reports \
+  --summary reports/plugin_smoke_noop/summary.json \
+  --summary reports/torch4ms_eval/eval/summary.json \
+  --out reports/analysis_figures
+```
+
+This writes PDF and PNG figures such as `failure_taxonomy.pdf` and
+`compatibility_overview.pdf`. Plotting is optional and requires Matplotlib.
+
 ## Versioning
 
 Repository: https://github.com/TeleHuang/TBBCC
@@ -173,6 +186,7 @@ skills/ar-baseline/SKILL.md      AR baseline calibration workflow
 agents/                          Specialist agent prompts
 references/                      Design and runtime notes
 scripts/tbbcc.py                 Deterministic benchmark core
+scripts/tbbcc_report_plots.py    Optional report visualization helpers
 scripts/calibrate_ar_cc.py       Claude Code AR baseline calibrator
 scripts/generate_benchmark_library.py
                                  Benchmark library generator
