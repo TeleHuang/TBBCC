@@ -1470,6 +1470,8 @@ def cmd_plot_reports(args: argparse.Namespace) -> int:
         kinds.append("design-space")
     if args.metric_scorecard:
         kinds.append("metric-scorecard")
+    if args.ground_truth_coverage:
+        kinds.append("ground-truth-coverage")
     result = generate_report_plots(
         [Path(item) for item in args.summary],
         Path(args.out).resolve(),
@@ -1557,6 +1559,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--metric-scorecard",
         action="store_true",
         help="Generate metric availability and scorecard figure",
+    )
+    p_plot.add_argument(
+        "--ground-truth-coverage",
+        action="store_true",
+        help="Generate GPU ground-truth coverage and artifact-completeness figure",
     )
     p_plot.set_defaults(func=cmd_plot_reports)
     return parser

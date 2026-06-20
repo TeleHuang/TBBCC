@@ -49,6 +49,7 @@ DEFAULT_KINDS = [
     "model-method-heatmap",
     "design-space",
     "metric-scorecard",
+    "ground-truth-coverage",
 ]
 
 TOLERANCE_GRID = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2]
@@ -89,6 +90,57 @@ def _bridge_from_payload(path: Path, data: dict[str, Any]) -> str:
         if label.startswith(prefix):
             return label[len(prefix):]
     return label
+
+
+def _is_gpu_ground_truth_summary(data: dict[str, Any]) -> bool:
+    return (
+        data.get("suite") == "L1"
+        and isinstance(data.get("passed_cases"), list)
+        and isinstance(data.get("environment"), dict)
+        and data.get("total_cases") is not None
+    )
+
+
+def _operator_family(operator: str) -> str:
+    text = operator.lower()
+    if "conv" in text:
+        return "convolution"
+    if "pool" in text:
+        return "pooling"
+    if "norm" in text:
+        return "normalization"
+    if any(token in text for token in ["relu", "gelu", "silu", "sigmoid", "tanh", "softmax", "mish", "hardswish"]):
+        return "activation"
+    if any(token in text for token in ["matmul", "bmm", "einsum", "linear", "attention"]):
+        return "linear/attention"
+    if any(token in text for token in ["reshape", "permute", "cat", "gather", "scatter", "topk", "sort", "argmax", "index"]):
+        return "tensor/indexing"
+    if any(token in text for token in ["complex", "polar", "angle", "view_as_real", "rope"]):
+        return "complex/positional"
+    if any(token in text for token in ["sum", "mean"]):
+        return "reduction"
+    return "other"
+
+
+def _artifact_exists(summary_path: Path, artifact_path: str | None) -> bool | None:
+    if not artifact_path:
+        return None
+    raw = Path(artifact_path)
+    candidates = [raw, summary_path.parent / raw]
+    candidates.extend(parent / raw for parent in summary_path.parents)
+    return any(path.exists() for path in candidates)
+
+
+def _resolve_artifact_path(summary_path: Path, artifact_path: str | None) -> Path | None:
+    if not artifact_path:
+        return None
+    raw = Path(artifact_path)
+    candidates = [raw, summary_path.parent / raw]
+    candidates.extend(parent / raw for parent in summary_path.parents)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
 
 
 def _infer_failure_class(error: str | None) -> str:
@@ -232,8 +284,156 @@ def _first_pass_rate_from_cases(cases: list[dict[str, Any]]) -> float | None:
     return passed / len(counted)
 
 
+def _read_gpu_ground_truth_summary(path: Path, data: dict[str, Any]) -> dict[str, Any]:
+    passed_cases = [case for case in data.get("passed_cases") or [] if isinstance(case, dict)]
+    failed_cases = [case for case in data.get("failed_cases") or [] if isinstance(case, dict)]
+    total = int(data.get("total_cases") or len(passed_cases) + len(failed_cases))
+    passed = int(data.get("passed") or len(passed_cases))
+    failed = int(data.get("failed") or len(failed_cases))
+    env = data.get("environment") or {}
+    target = env.get("target_bridge") if isinstance(env.get("target_bridge"), dict) else {}
+
+    cases: list[dict[str, Any]] = []
+    artifact_checks = {"output": 0, "intermediate": 0, "gradients": 0, "missing": 0}
+    for case in passed_cases:
+        case_id = str(case.get("test_case_id") or "")
+        operator = str(case.get("operator") or "unknown")
+        risk = str(case.get("known_risk") or "none")
+        output_exists = _artifact_exists(path, case.get("output_path"))
+        json_exists = _artifact_exists(path, case.get("json_path"))
+        if output_exists:
+            artifact_checks["output"] += 1
+        else:
+            artifact_checks["missing"] += 1
+        if json_exists is False:
+            artifact_checks["missing"] += 1
+        # Summary rows imply intermediate/gradient files by convention; per-case
+        # metadata is checked later when the individual JSON is present.
+        json_path = case.get("json_path")
+        meta_path = _resolve_artifact_path(path, json_path)
+        if meta_path is not None:
+            try:
+                meta = _load_json(meta_path)
+                if _artifact_exists(path, _nested_get(meta, ["intermediate", "binary_path"])):
+                    artifact_checks["intermediate"] += 1
+                else:
+                    artifact_checks["missing"] += 1
+                if _artifact_exists(path, _nested_get(meta, ["gradients", "binary_path"])):
+                    artifact_checks["gradients"] += 1
+                else:
+                    artifact_checks["missing"] += 1
+            except Exception:
+                artifact_checks["missing"] += 1
+        cases.append(
+            {
+                "case_id": case_id,
+                "name": operator,
+                "ok": True,
+                "skipped": False,
+                "suite": "gpu-ground-truth",
+                "category": _operator_family(operator),
+                "counts_toward_adaptation": True,
+                "error": None,
+                "details": {
+                    "operator": operator,
+                    "operator_family": _operator_family(operator),
+                    "known_risk": risk,
+                    "gradient_count": case.get("gradient_count"),
+                    "output_shape": case.get("output_shape"),
+                    "json_path": case.get("json_path"),
+                    "output_path": case.get("output_path"),
+                },
+            }
+        )
+    for case in failed_cases:
+        operator = str(case.get("operator") or "unknown")
+        cases.append(
+            {
+                "case_id": str(case.get("test_case_id") or ""),
+                "name": operator,
+                "ok": False,
+                "skipped": False,
+                "suite": "gpu-ground-truth",
+                "category": _operator_family(operator),
+                "counts_toward_adaptation": True,
+                "error": str(case.get("error") or "failed"),
+                "details": {
+                    "operator": operator,
+                    "operator_family": _operator_family(operator),
+                    "known_risk": str(case.get("known_risk") or "unknown"),
+                },
+            }
+        )
+
+    success_rate = _safe_float(data.get("success_rate"))
+    if success_rate is None and total:
+        success_rate = passed / total
+    artifact_expected = total * 3
+    artifact_present = artifact_checks["output"] + artifact_checks["intermediate"] + artifact_checks["gradients"]
+    artifact_completeness = artifact_present / artifact_expected if artifact_expected else None
+    unique_operators = sorted(
+        {
+            str((case.get("details") or {}).get("operator") or case.get("name") or "")
+            for case in cases
+            if str((case.get("details") or {}).get("operator") or case.get("name") or "")
+        }
+    )
+    return {
+        "path": str(path),
+        "label": f"GPU L1 ground truth ({env.get('gpu', 'GPU')})",
+        "bridge": target.get("name") or "gpu-ground-truth",
+        "failure_classes": {} if failed == 0 else {"RuntimeCrash": failed},
+        "compatibility_rate": success_rate,
+        "raw_pass_rate": success_rate,
+        "total": total,
+        "cases": cases,
+        "passed_cases": passed,
+        "failed_cases": failed,
+        "by_suite": {"gpu-ground-truth": {"adaptation_rate": success_rate, "passed": passed, "total": total}},
+        "by_category": {},
+        "numeric_fidelity": {},
+        "quality_numeric": {},
+        "benchmark_summary": {},
+        "agent_report": {},
+        "effort": {},
+        "metrics": {
+            "compatibility": success_rate,
+            "raw_pass": success_rate,
+            "first_pass": success_rate,
+            "numeric": None,
+            "numeric_within_tolerance": None,
+            "performance": None,
+            "ME": None,
+            "AR": None,
+            "gt_success": success_rate,
+            "artifact_completeness": artifact_completeness,
+            "unique_operators": float(len(unique_operators)) if unique_operators else None,
+            "operator_families": float(len({c["category"] for c in cases})) if cases else None,
+        },
+        "source_type": "gpu_ground_truth",
+        "ground_truth": {
+            "suite": data.get("suite"),
+            "seed": data.get("seed"),
+            "environment": env,
+            "total_cases": total,
+            "passed": passed,
+            "failed": failed,
+            "success_rate": success_rate,
+            "artifact_expected": artifact_expected,
+            "artifact_present": artifact_present,
+            "artifact_missing": artifact_checks["missing"],
+            "artifact_completeness": artifact_completeness,
+            "unique_operators": len(unique_operators),
+            "target_bridge": target,
+        },
+    }
+
+
 def _read_summary(path: Path) -> dict[str, Any]:
     data = _load_json(path)
+    if _is_gpu_ground_truth_summary(data):
+        return _read_gpu_ground_truth_summary(path, data)
+
     failures = data.get("failure_classes") if isinstance(data.get("failure_classes"), dict) else None
     if failures is None:
         failures = _failure_classes_from_demo_payload(data)
@@ -383,8 +583,13 @@ def _add_panel_label(ax: Any, label: str) -> None:
     )
 
 
+def _evaluation_summaries(summaries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in summaries if item.get("source_type") != "gpu_ground_truth"]
+
+
 def plot_compatibility_overview(summaries: list[dict[str, Any]], out_base: Path) -> tuple[list[Path], list[Path], dict[str, Any]]:
     plt = _require_matplotlib()
+    summaries = _evaluation_summaries(summaries)
     rows = [
         {
             "label": item["label"],
@@ -426,6 +631,7 @@ def plot_compatibility_overview(summaries: list[dict[str, Any]], out_base: Path)
 
 def plot_failure_taxonomy(summaries: list[dict[str, Any]], out_base: Path) -> tuple[list[Path], list[Path], dict[str, Any]]:
     plt = _require_matplotlib()
+    summaries = _evaluation_summaries(summaries)
     classes = sorted({name for item in summaries for name in item["failure_classes"]})
     labels = [item["label"] for item in summaries]
     rows = []
@@ -460,6 +666,7 @@ def plot_failure_taxonomy(summaries: list[dict[str, Any]], out_base: Path) -> tu
 
 def plot_tolerance_sweep(summaries: list[dict[str, Any]], out_base: Path) -> tuple[list[Path], list[Path], dict[str, Any]]:
     plt = _require_matplotlib()
+    summaries = _evaluation_summaries(summaries)
     rows: list[dict[str, Any]] = []
     for item in summaries:
         cases = [c for c in item["cases"] if not c.get("skipped") and c.get("counts_toward_adaptation", True)]
@@ -553,6 +760,7 @@ def plot_tolerance_sweep(summaries: list[dict[str, Any]], out_base: Path) -> tup
 
 def plot_model_method_heatmap(summaries: list[dict[str, Any]], out_base: Path) -> tuple[list[Path], list[Path], dict[str, Any]]:
     plt = _require_matplotlib()
+    summaries = _evaluation_summaries(summaries)
     rows: list[dict[str, Any]] = []
     for item in summaries:
         by_suite = item.get("by_suite") or {}
@@ -637,6 +845,7 @@ def plot_model_method_heatmap(summaries: list[dict[str, Any]], out_base: Path) -
 
 def plot_design_space(summaries: list[dict[str, Any]], out_base: Path) -> tuple[list[Path], list[Path], dict[str, Any]]:
     plt = _require_matplotlib()
+    summaries = _evaluation_summaries(summaries)
     rows: list[dict[str, Any]] = []
     for item in summaries:
         for case in item["cases"]:
@@ -711,6 +920,8 @@ def plot_metric_scorecard(summaries: list[dict[str, Any]], out_base: Path) -> tu
         ("compatibility", "Compat."),
         ("raw_pass", "Raw pass"),
         ("first_pass", "First pass"),
+        ("gt_success", "GT pass"),
+        ("artifact_completeness", "Artifacts"),
         ("numeric", "Numeric"),
         ("numeric_within_tolerance", "Tol. ok"),
         ("AR", "AR"),
@@ -780,6 +991,128 @@ def plot_metric_scorecard(summaries: list[dict[str, Any]], out_base: Path) -> tu
     return figures, [data_path], {"provenance": "real report summary fields", "note": "Replaces radar charts when metric availability is incomplete."}
 
 
+def plot_ground_truth_coverage(summaries: list[dict[str, Any]], out_base: Path) -> tuple[list[Path], list[Path], dict[str, Any]]:
+    plt = _require_matplotlib()
+    gt_items = [item for item in summaries if item.get("source_type") == "gpu_ground_truth"]
+    rows: list[dict[str, Any]] = []
+    family_rows: list[dict[str, Any]] = []
+    risk_rows: list[dict[str, Any]] = []
+    artifact_rows: list[dict[str, Any]] = []
+    for item in gt_items:
+        gt = item.get("ground_truth") or {}
+        rows.append(
+            {
+                "label": item["label"],
+                "bridge": item["bridge"],
+                "suite": gt.get("suite"),
+                "seed": gt.get("seed"),
+                "gpu": (gt.get("environment") or {}).get("gpu"),
+                "pytorch": (gt.get("environment") or {}).get("pytorch"),
+                "cuda": (gt.get("environment") or {}).get("cuda"),
+                "total_cases": gt.get("total_cases"),
+                "passed": gt.get("passed"),
+                "failed": gt.get("failed"),
+                "success_rate": gt.get("success_rate"),
+                "artifact_expected": gt.get("artifact_expected"),
+                "artifact_present": gt.get("artifact_present"),
+                "artifact_missing": gt.get("artifact_missing"),
+                "artifact_completeness": gt.get("artifact_completeness"),
+                "unique_operators": gt.get("unique_operators"),
+            }
+        )
+        family_counts: dict[str, int] = {}
+        risk_counts: dict[str, int] = {}
+        grad_counts: dict[str, int] = {}
+        for case in item["cases"]:
+            details = case.get("details") if isinstance(case.get("details"), dict) else {}
+            family = str(details.get("operator_family") or case.get("category") or "other")
+            risk = str(details.get("known_risk") or "none")
+            grad_count = str(details.get("gradient_count"))
+            family_counts[family] = family_counts.get(family, 0) + 1
+            risk_counts[risk] = risk_counts.get(risk, 0) + 1
+            grad_counts[grad_count] = grad_counts.get(grad_count, 0) + 1
+        for family, count in sorted(family_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            family_rows.append({"label": item["label"], "operator_family": family, "case_count": count})
+        for risk, count in sorted(risk_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            risk_rows.append({"label": item["label"], "known_risk": risk, "case_count": count})
+        for grad_count, count in sorted(grad_counts.items(), key=lambda kv: kv[0]):
+            artifact_rows.append({"label": item["label"], "gradient_count": grad_count, "case_count": count})
+
+    data_paths = [
+        _save_rows(out_base.parent / "source_data" / f"{out_base.name}_summary.csv", rows),
+        _save_rows(out_base.parent / "source_data" / f"{out_base.name}_families.csv", family_rows),
+        _save_rows(out_base.parent / "source_data" / f"{out_base.name}_risks.csv", risk_rows),
+        _save_rows(out_base.parent / "source_data" / f"{out_base.name}_gradients.csv", artifact_rows),
+    ]
+
+    fig = plt.figure(figsize=(7.2, 4.6))
+    gs = fig.add_gridspec(2, 3, height_ratios=[0.9, 1.55], width_ratios=[1.05, 1.2, 1.0], hspace=0.42, wspace=0.42)
+    ax_card = fig.add_subplot(gs[0, :])
+    ax_family = fig.add_subplot(gs[1, 0:2])
+    ax_risk = fig.add_subplot(gs[1, 2])
+    ax_card.axis("off")
+    if not gt_items:
+        ax_card.text(0.5, 0.5, "No GPU ground-truth summary supplied", ha="center", va="center", fontsize=9, color=PALETTE["neutral_dark"])
+        for ax in (ax_family, ax_risk):
+            ax.axis("off")
+        fig.subplots_adjust(left=0.08, right=0.98, bottom=0.12, top=0.94, hspace=0.52, wspace=0.48)
+        figures = _save_figure(fig, out_base)
+        return figures, data_paths, {"provenance": "not available", "note": "No gpu-ground-truth summary was provided."}
+
+    gt = gt_items[0].get("ground_truth") or {}
+    env = gt.get("environment") or {}
+    card_items = [
+        ("Cases", f"{gt.get('passed', 0)}/{gt.get('total_cases', 0)}"),
+        ("Operators", str(gt.get("unique_operators") or "n/a")),
+        ("Success", _rate_text(_safe_float(gt.get("success_rate")))),
+        ("Artifacts", _rate_text(_safe_float(gt.get("artifact_completeness")))),
+        ("GPU", str(env.get("gpu") or "n/a").replace("NVIDIA GeForce ", "")),
+    ]
+    for i, (title, value) in enumerate(card_items):
+        x0 = 0.02 + i * 0.19
+        width = 0.17
+        ax_card.add_patch(
+            plt.Rectangle((x0, 0.17), width, 0.68, facecolor="#F1F5F9", edgecolor="#D8D8D8", linewidth=0.8)
+        )
+        ax_card.text(x0 + 0.025, 0.66, title, ha="left", va="center", fontsize=7, color=PALETTE["neutral_dark"])
+        ax_card.text(x0 + 0.025, 0.39, value, ha="left", va="center", fontsize=13, fontweight="bold", color=PALETTE["blue_main"])
+    subtitle = f"PyTorch {env.get('pytorch', 'n/a')} · CUDA {env.get('cuda', 'n/a')} · seed {gt.get('seed', 'n/a')}"
+    ax_card.text(0.02, 0.02, subtitle, ha="left", va="bottom", fontsize=6, color=PALETTE["neutral_dark"])
+    _add_panel_label(ax_card, "g")
+
+    fam = [r for r in family_rows if r["label"] == gt_items[0]["label"]]
+    fam = sorted(fam, key=lambda r: int(r["case_count"]))
+    ax_family.barh(
+        [r["operator_family"] for r in fam],
+        [int(r["case_count"]) for r in fam],
+        color=PALETTE["blue_main"],
+        alpha=0.88,
+    )
+    for y, r in enumerate(fam):
+        ax_family.text(int(r["case_count"]) + 0.4, y, str(r["case_count"]), va="center", fontsize=6)
+    ax_family.set_xlabel("L1 cases")
+    ax_family.set_title("Operator-family coverage")
+    ax_family.grid(axis="x", linestyle=":", linewidth=0.5, alpha=0.65)
+
+    risks = [r for r in risk_rows if r["label"] == gt_items[0]["label"]]
+    colors = [PALETTE["green"] if r["known_risk"] == "none" else PALETTE["orange"] if r["known_risk"] == "semantic_diff" else PALETTE["red"] for r in risks]
+    ax_risk.bar(
+        [r["known_risk"] for r in risks],
+        [int(r["case_count"]) for r in risks],
+        color=colors,
+        alpha=0.88,
+    )
+    ax_risk.set_title("Known-risk labels")
+    ax_risk.set_ylabel("Cases")
+    ax_risk.tick_params(axis="x", rotation=35)
+    for tick in ax_risk.get_xticklabels():
+        tick.set_ha("right")
+    ax_risk.grid(axis="y", linestyle=":", linewidth=0.5, alpha=0.65)
+    fig.subplots_adjust(left=0.17, right=0.98, bottom=0.20, top=0.94, hspace=0.54, wspace=0.56)
+    figures = _save_figure(fig, out_base)
+    return figures, data_paths, {"provenance": "GPU ground-truth artifacts", "note": "Shows reference-data coverage and artifact completeness for later GPU-vs-NPU comparison."}
+
+
 PLOTTERS = {
     "compatibility-overview": plot_compatibility_overview,
     "failure-taxonomy": plot_failure_taxonomy,
@@ -787,6 +1120,7 @@ PLOTTERS = {
     "model-method-heatmap": plot_model_method_heatmap,
     "design-space": plot_design_space,
     "metric-scorecard": plot_metric_scorecard,
+    "ground-truth-coverage": plot_ground_truth_coverage,
 }
 
 

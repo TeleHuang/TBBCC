@@ -162,21 +162,32 @@ summary reports:
 
 ```bash
 python scripts/tbbcc.py plot-reports \
+  --summary /path/to/gpu-ground-truth/L1/summary.json \
   --summary reports/plugin_smoke_noop/summary.json \
   --summary reports/torch4ms_eval/eval/summary.json \
   --out reports/analysis_figures
 ```
 
-This writes an optional compatibility-analysis bundle:
+This command reads one or more evaluation `summary.json` files. It can also read
+a GPU ground-truth `summary.json` containing reference PyTorch outputs,
+intermediate tensors and gradients for later GPU-vs-NPU numerical comparison.
+It writes an optional compatibility-analysis bundle:
 
 - SVG/PDF/PNG figures with editable vector text
 - `source_data/*.csv` for every figure
 - `plot_manifest.json` with source summaries and provenance notes
 - default plots: compatibility overview, failure taxonomy, tolerance sweep,
-  model/component heatmap, 2D design-space bubble chart, and metric scorecard
+  model/component heatmap, 2D design-space bubble chart, metric scorecard, and
+  GPU ground-truth coverage when a ground-truth summary is supplied
 
-Pass flags such as `--metric-scorecard` or `--tolerance-sweep` to generate only
-selected plots. Plotting is optional and requires Matplotlib.
+The ground-truth coverage figure reports reference case count, unique operators,
+pass rate, artifact completeness, operator-family coverage and known-risk
+labels. It is a reference-data readiness check, not a bridge compatibility
+score.
+
+Pass flags such as `--metric-scorecard`, `--tolerance-sweep` or
+`--ground-truth-coverage` to generate only selected plots. Plotting is optional
+and requires Matplotlib.
 
 ## Versioning
 
