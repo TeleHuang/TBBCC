@@ -167,8 +167,16 @@ python scripts/tbbcc.py plot-reports \
   --out reports/analysis_figures
 ```
 
-This writes PDF and PNG figures such as `failure_taxonomy.pdf` and
-`compatibility_overview.pdf`. Plotting is optional and requires Matplotlib.
+This writes an optional compatibility-analysis bundle:
+
+- SVG/PDF/PNG figures with editable vector text
+- `source_data/*.csv` for every figure
+- `plot_manifest.json` with source summaries and provenance notes
+- default plots: compatibility overview, failure taxonomy, tolerance sweep,
+  model/component heatmap, 2D design-space bubble chart, and metric scorecard
+
+Pass flags such as `--metric-scorecard` or `--tolerance-sweep` to generate only
+selected plots. Plotting is optional and requires Matplotlib.
 
 ## Versioning
 

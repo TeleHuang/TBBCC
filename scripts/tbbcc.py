@@ -1462,6 +1462,14 @@ def cmd_plot_reports(args: argparse.Namespace) -> int:
         kinds.append("failure-taxonomy")
     if args.compatibility_overview:
         kinds.append("compatibility-overview")
+    if args.tolerance_sweep:
+        kinds.append("tolerance-sweep")
+    if args.model_method_heatmap:
+        kinds.append("model-method-heatmap")
+    if args.design_space:
+        kinds.append("design-space")
+    if args.metric_scorecard:
+        kinds.append("metric-scorecard")
     result = generate_report_plots(
         [Path(item) for item in args.summary],
         Path(args.out).resolve(),
@@ -1519,7 +1527,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to a TorchBridgeBench or eval-migration summary.json. Repeat for comparisons.",
     )
-    p_plot.add_argument("--out", required=True, help="Output directory for PDF/PNG figures")
+    p_plot.add_argument("--out", required=True, help="Output directory for SVG/PDF/PNG figures and source data")
     p_plot.add_argument(
         "--failure-taxonomy",
         action="store_true",
@@ -1529,6 +1537,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--compatibility-overview",
         action="store_true",
         help="Generate compatibility-vs-raw-pass overview figure",
+    )
+    p_plot.add_argument(
+        "--tolerance-sweep",
+        action="store_true",
+        help="Generate tolerance sensitivity figure from numeric-error fields",
+    )
+    p_plot.add_argument(
+        "--model-method-heatmap",
+        action="store_true",
+        help="Generate bridge x suite/category pass-rate heatmap",
+    )
+    p_plot.add_argument(
+        "--design-space",
+        action="store_true",
+        help="Generate 2D model/component/failure-mode design-space chart",
+    )
+    p_plot.add_argument(
+        "--metric-scorecard",
+        action="store_true",
+        help="Generate metric availability and scorecard figure",
     )
     p_plot.set_defaults(func=cmd_plot_reports)
     return parser
