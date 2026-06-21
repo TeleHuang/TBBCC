@@ -47,6 +47,14 @@ Existing `reports/**/adapter.generated.json` and `reports/**/suite.generated.jso
 files are historical artifacts; do not reuse them unless you explicitly ask to
 resume or reuse them.
 
+For bridges that ship a reference adapter example under `../-demo/examples`,
+the automatic workflow should use it as high-priority evidence. For torch4ms,
+verify whether the generated adapter preserves `Configuration.default_device_target`
+and `TORCH4MS_DEVICE_TARGET`; a bare `default_env().__enter__()` may select CPU
+and produce misleading numeric failures. The report must state the actual
+backend/device. If an intended Ascend/NPU run falls back to CPU, treat the result
+as a backend configuration diagnostic rather than a final compatibility claim.
+
 ## Manual Run
 
 From the plugin root:

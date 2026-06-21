@@ -34,6 +34,17 @@ does not request a quick smoke/dev run, default to the full benchmark
 `benchmarks/v1.0.0/suites/all_noop.json` covering 175 cases (L1=67, L2=42,
 L3=25, L4=41). Always state the evaluated case count in the final summary.
 
+Adapter/backend guard: normal bridge evaluation must not silently replace a
+reference adapter with a weaker ad-hoc preamble. If `../-demo/examples` contains
+a bridge adapter, read it and preserve its backend configuration semantics. For
+torch4ms this includes `torch4ms.config.Configuration`,
+`default_device_target`, `TORCH4MS_DEVICE_TARGET`, graph-mode flags, activation
+script notes, and PYTHONPATH/source-tree assumptions. Before a large run,
+execute a small backend sanity check and record the actual backend/device. If
+the target bridge is expected to run on Ascend/NPU but logs show
+`device_target: CPU`, classify the run as an environment/backend diagnostic
+until remediated; do not present it as the intended NPU compatibility result.
+
 ## Phase 1: Deterministic Verification
 
 Run the core:
@@ -54,6 +65,12 @@ attempt environment remediation before final classification. Examples include
 checking activation scripts, local source checkouts, `PYTHONPATH`, and working
 directory assumptions. This remediation is not counted as `effort_adapt` or
 `effort_repair`.
+
+If verification produces broad NumericMismatch across very simple deterministic
+cases such as ReLU, reshape, or linear layers, first audit whether source and
+target used the same inputs, seeds, adapter configuration, and backend. A
+near-zero cosine on simple cases is configuration evidence until disproven, not
+automatic proof that the bridge internals are unfixable.
 
 ## Phase 2: Classification
 

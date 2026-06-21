@@ -41,7 +41,23 @@ Read these files before nontrivial work:
    directory from the discovered docs or minimal example, and record
    adapter-authoring effort in an effort ledger. Environment remediation is not
    counted as effort.
-5. Select benchmark scope explicitly:
+5. For bridges with a reference adapter under
+   `${CLAUDE_PLUGIN_ROOT}/../-demo/examples/<bridge>_adapter.json`, use it as
+   high-priority evidence. Preserve backend configuration semantics such as
+   torch4ms `Configuration.default_device_target`, `TORCH4MS_DEVICE_TARGET`, and
+   required activation/PYTHONPATH notes. Do not replace a reference adapter with
+   a weaker bare import/default context unless you explicitly justify the
+   difference.
+6. Before running a large suite, run a tiny adapter/backend sanity check:
+   - verify the bridge imports in the same environment that will run the suite;
+   - verify the actual backend/device selected by the bridge;
+   - for torch4ms, inspect the `Initialized MindSpore with configuration`
+     message or equivalent runtime config.
+   If the intended target is Ascend/NPU but the runtime selects CPU, first try
+   environment remediation. If it remains CPU, clearly label the run as a CPU
+   backend diagnostic (`CPU backend diagnostic`) and do not present it as the bridge's intended NPU
+   compatibility result.
+7. Select benchmark scope explicitly:
    - If the user names a suite, use that suite.
    - If the user asks for a quick smoke/dev check, use `smoke_noop.json` or
      `dev_noop.json` and state the small case count clearly.
@@ -49,30 +65,34 @@ Read these files before nontrivial work:
      for a full benchmark run. The benchmark asset baseline is 175 cases
      (L1=67, L2=42, L3=25, L4=41); do not silently downgrade to a 4-case smoke
      suite for a normal bridge evaluation.
-6. Use a fresh output directory by default. If the user gives `reports/<name>`
+8. Use a fresh output directory by default. If the user gives `reports/<name>`
    and it already contains generated artifacts, create a timestamped child or
    sibling such as `reports/<name>_<YYYYmmdd_HHMMSS>` unless the user explicitly
    says to overwrite, resume, or reuse.
-7. Generate a suite for the fresh adapter by copying the selected benchmark
+9. Generate a suite for the fresh adapter by copying the selected benchmark
    scope and replacing only the adapter path.
-8. Run:
+10. Run:
 
    ```bash
    python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval-suite --suite <suite.json> --out <out-dir>
    ```
 
-9. For a single explicit case, run:
+11. For a single explicit case, run:
 
    ```bash
    python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval --case <case.json> --adapter <adapter.json> --out <out-dir>
    ```
 
-10. Read the generated report or summary before concluding.
-11. Always state the benchmark scope and sample size in the final response, for
+12. Read the generated report or summary before concluding.
+13. Always state the benchmark scope, sample size, and actual backend/device in
+    the final response. If simple cases such as ReLU or reshape fail with broad
+    NumericMismatch and cosine near zero, audit adapter/backend configuration
+    before concluding the bridge is internally wrong.
+14. Always state the benchmark scope and sample size in the final response, for
     example `0/4 smoke cases` versus `160/175 full benchmark cases`. Never imply
     that a smoke result represents the full benchmark.
-12. Confirm failure classification before repair when the result is nontrivial.
-13. Repair only migration-side files unless the user explicitly asks for bridge
+15. Confirm failure classification before repair when the result is nontrivial.
+16. Repair only migration-side files unless the user explicitly asks for bridge
    internals.
 
 ## Constraints

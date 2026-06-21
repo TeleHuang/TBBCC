@@ -99,6 +99,23 @@ def test_eval_skill_guards_against_smoke_regression() -> None:
         assert phrase in text
 
 
+def test_eval_skill_guards_against_backend_adapter_regression() -> None:
+    eval_text = (ROOT / "skills" / "torchbridgebench" / "SKILL.md").read_text(encoding="utf-8")
+    adapter_text = (ROOT / "agents" / "adapter-author.md").read_text(encoding="utf-8")
+    combined = eval_text + "\n" + adapter_text
+    required_phrases = [
+        "../-demo/examples/<bridge>_adapter.json",
+        "Configuration.default_device_target",
+        "TORCH4MS_DEVICE_TARGET",
+        "bare `torch4ms.default_env().__enter__()` is not",
+        "backend sanity check",
+        "device_target",
+        "CPU backend diagnostic",
+    ]
+    for phrase in required_phrases:
+        assert phrase in combined
+
+
 def test_benchmark_assets_do_not_regress() -> None:
     cases = list((ROOT / "benchmarks" / "v1.0.0" / "cases").rglob("*.json"))
     assert len(cases) == 175

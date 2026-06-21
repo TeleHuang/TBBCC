@@ -31,6 +31,21 @@ Adapter rules:
 - Do not silently hide unsupported features; record them in `known_gaps`.
 - Prefer robust import checks and clear error messages in `preamble` when the
   bridge package may be missing.
+- Prefer project-provided adapter examples over ad-hoc minimal preambles. If
+  `${CLAUDE_PLUGIN_ROOT}/../-demo/examples/<bridge>_adapter.json` exists, read
+  it and preserve its documented enable preamble, configuration object, and
+  required environment variables unless local docs prove they are obsolete.
+- For torch4ms specifically, a bare `torch4ms.default_env().__enter__()` is not
+  a sufficient adapter when the reference adapter configures
+  `torch4ms.config.Configuration`, `default_device_target`, or
+  `TORCH4MS_DEVICE_TARGET`. The generated adapter must either configure the
+  intended backend explicitly or record why that backend is unavailable.
+- Before running a large suite, perform a small backend sanity check and inspect
+  stderr/stdout for the actual backend, for example torch4ms
+  `Initialized MindSpore with configuration: {'device_target': ...}`. If the
+  actual backend is CPU while the evaluation target is Ascend/NPU, treat this as
+  environment/backend configuration remediation, not as bridge compatibility
+  evidence.
 
 Effort rules:
 
