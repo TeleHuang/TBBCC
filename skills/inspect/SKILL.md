@@ -20,6 +20,9 @@ python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py inspect-env
 find ${CLAUDE_PLUGIN_ROOT} -maxdepth 3 -type f | sort
 ```
 
+Use `inspect-env --import-versions` only when exact package versions are needed;
+some ML frameworks print noisy initialization warnings on import.
+
 If the user asks about installed marketplaces or plugins:
 
 ```bash
@@ -33,8 +36,21 @@ Summarize:
 
 - Claude Code executable and version,
 - plugin validation status,
-- relevant framework/package availability,
+- Python importability of relevant frameworks/packages,
+- nearby local bridge source trees separately from importability,
 - plugin file structure,
 - any missing prerequisites or risk.
+
+Use precise wording:
+
+- `available: false` from `inspect-env` means the module is not importable in
+  the current Python environment. It does not prove that a local source checkout
+  or minimal example is absent.
+- For bridge libraries such as torch4ms or mindtorch, distinguish
+  "not importable yet" from "no local source discovered".
+- `torch_npu` is the PyTorch Ascend backend. Its absence affects PyTorch-on-NPU
+  runs, not NVIDIA GPU ground-truth collection on a separate GPU host.
+- Do not claim GPU ground-truth is blocked on this NPU host; report it as a
+  separate-machine workflow when appropriate.
 
 Do not read or print API keys, tokens, or `.secrets` content.

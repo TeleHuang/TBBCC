@@ -770,7 +770,54 @@ def inspect_environment(import_versions: bool = False) -> dict[str, Any]:
             except Exception as exc:
                 module_info["version"] = f"import_error: {exc}"
         info["modules"][name] = module_info
+    info["local_bridge_sources"] = discover_local_bridge_sources(Path.cwd())
     return info
+
+
+def discover_local_bridge_sources(cwd: Path) -> dict[str, list[str]]:
+    """Find nearby bridge source trees without importing them."""
+    roots = []
+    for candidate in (cwd, cwd.parent, cwd.parent.parent):
+        if candidate not in roots and candidate.exists():
+            roots.append(candidate)
+    patterns = {
+        "torch4ms": (("torch4ms", "ascend-torch4ms"), ("torch4ms",)),
+        "mindtorch": (("mindtorch",), ("mindtorch",)),
+        "mindtorch_v2": (("mindtorch", "mindtorch-v2", "mindtorch_v2"), ("mindtorch", "mindtorch_v2")),
+        "mindnlp": (("mindnlp",), ("mindnlp",)),
+    }
+    found: dict[str, list[str]] = {name: [] for name in patterns}
+    for root in roots:
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            lowered = child.name.lower()
+            for bridge, (needles, package_names) in patterns.items():
+                if any(needle in lowered for needle in needles):
+                    if not _looks_like_source_tree(child, package_names):
+                        continue
+                    resolved = str(child.resolve())
+                    if resolved not in found[bridge]:
+                        found[bridge].append(resolved)
+    return {name: paths for name, paths in found.items() if paths}
+
+
+def _looks_like_source_tree(path: Path, package_names: tuple[str, ...]) -> bool:
+    for package in package_names:
+        if (path / package).is_dir() or (path / "src" / package).is_dir():
+            return True
+    for marker in ("pyproject.toml", "setup.py", "setup.cfg"):
+        if (path / marker).exists():
+            return True
+    if any(path.glob("README*")):
+        return True
+    if (path / "docs").is_dir() or (path / "examples").is_dir():
+        return True
+    return any(path.glob("test_*.py"))
 
 
 def write_report(report: dict[str, Any], out_dir: Path) -> tuple[Path, Path]:

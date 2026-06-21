@@ -58,6 +58,20 @@ RESULT = os.environ.get("TBBCC_TARGET_ONLY")
     assert target.result == "yes"
 
 
+def test_discover_local_bridge_sources_without_importing(tmp_path: Path) -> None:
+    workspace = tmp_path / "work"
+    plugin = workspace / "torchbridgebenchCCplugin"
+    source = workspace / "ascend-torch4ms-ms272-stable"
+    artifact = workspace / "tmp_torch4ms_adapters"
+    plugin.mkdir(parents=True)
+    source.mkdir()
+    artifact.mkdir()
+    (source / "test_train_cnn.py").write_text("import torch4ms\n", encoding="utf-8")
+
+    found = tbbcc.discover_local_bridge_sources(plugin)
+    assert found["torch4ms"] == [str(source.resolve())]
+
+
 def test_run_eval_with_generated_suite_relative_paths(tmp_path: Path) -> None:
     case = tmp_path / "cases" / "case.json"
     adapter = tmp_path / "adapters" / "adapter.json"
