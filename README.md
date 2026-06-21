@@ -6,28 +6,40 @@ Claude Code commands for running cases, suites, and environment checks.
 
 ## Quick Start
 
-Start Claude Code with this plugin loaded:
+Validate the plugin first:
 
 ```bash
-claude --plugin-dir /path/torchbridgebenchCCplugin
+cd /home/ma-user/work/torchbridgebenchCCplugin
+claude plugin validate .
 ```
 
-Fill path with your actual path.
+For local development or manual inspection, start Claude Code with this plugin
+loaded for the current session:
 
-Inside Claude Code, reload plugins:
+```bash
+claude --plugin-dir /home/ma-user/work/torchbridgebenchCCplugin
+```
+
+If you are already in an old Claude Code TUI, exit and restart with
+`--plugin-dir`. `/reload-plugins` only reloads plugins already known to that
+session; it does not replace `--plugin-dir` startup for an uninstalled local
+plugin.
+
+Inside Claude Code, confirm the plugin is loaded:
 
 ```text
-/reload-plugins
+/torchbridgebench:inspect
 ```
 
-After editing command or skill files, reload before testing the same TUI window.
-Otherwise Claude Code may continue using the previously loaded prompt.
-
-Confirm the plugin is loaded:
+Run an end-to-end bridge evaluation with natural language:
 
 ```text
-/torchbridgebench:torchbridgebench-inspect
+/torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，参考 test_train_cnn.py 里的 default_env、loss_wrapper 和 Torch4msOptimizer 用法，输出到 reports/torch4ms_eval
 ```
+
+Claude Code 2.1.183 does not provide `claude plugin add`. Use `--plugin-dir`
+for local manual checks, or the marketplace/install workflow for packaged
+distribution.
 
 Run a single smoke case:
 
@@ -199,8 +211,9 @@ Current release baseline: `0.1.0`.
 
 ```text
 .claude-plugin/plugin.json       Plugin manifest
-commands/                        Slash commands
-skills/                          Skill-based workflows
+skills/                          Skill-based slash workflows
+skills/torchbridgebench/SKILL.md Primary /torchbridgebench:eval workflow
+skills/inspect/SKILL.md          /torchbridgebench:inspect workflow
 skills/ar-baseline/SKILL.md      AR baseline calibration workflow
 agents/                          Specialist agent prompts
 references/                      Design and runtime notes
