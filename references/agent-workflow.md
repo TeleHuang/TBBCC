@@ -25,6 +25,15 @@ entry, generates a suite pointing to the adapter, and invokes the deterministic
 core. If no docs or minimal examples can be found, it asks the user for one of
 those inputs instead of failing on a missing placeholder path.
 
+Regression guard: normal bridge evaluation must not silently collapse to the
+4-case `smoke_noop` suite or reuse stale `reports/**/suite.generated.json`
+artifacts. Historical reports can inform diagnosis, but every new natural
+language eval should create fresh adapter/suite artifacts unless the user
+explicitly asks to resume or reuse. When the user does not specify a suite and
+does not request a quick smoke/dev run, default to the full benchmark
+`benchmarks/v1.0.0/suites/all_noop.json` covering 175 cases (L1=67, L2=42,
+L3=25, L4=41). Always state the evaluated case count in the final summary.
+
 ## Phase 1: Deterministic Verification
 
 Run the core:
@@ -92,7 +101,8 @@ python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval-suite \
   --out reports/bench_dev
 ```
 
-Use the cross-level smoke suite when you explicitly want L3/L4 coverage:
+Use the cross-level smoke suite only when you explicitly want a quick L1/L2/L3/L4
+check rather than a representative benchmark:
 
 ```bash
 python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval-suite \
@@ -100,5 +110,5 @@ python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval-suite \
   --out reports/bench_smoke
 ```
 
-Use `all_noop.json` or the per-level suites when you need broader coverage and
-accept substantially higher runtime.
+Use `all_noop.json` for normal bridge evaluation and final claims. Use
+per-level suites when isolating a level-specific regression.

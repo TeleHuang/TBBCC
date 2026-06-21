@@ -48,6 +48,19 @@ Claude Code 插件的结构、易用入口、测试基础和评测运行正确�
 验收测试必须覆盖：source 侧故意污染 Python 进程状态时，target 侧仍
 能看到干净状态。
 
+### P0-4 Benchmark 资产不可退化
+
+`benchmarks/v1.0.0/` 是系统的核心资产。当前恢复标准：
+
+- 总用例数必须保持 175。
+- 分层数量必须保持 L1=67、L2=42、L3=25、L4=41。
+- `all_noop.json` 必须覆盖 175 个 case。
+- `smoke_noop.json` 只是 4-case 快速检查，不能作为普通桥接器评测默认值。
+
+自然语言 `/torchbridgebench:eval` 在用户未指定 suite 且未要求 quick
+smoke/dev 时，必须默认选择 full benchmark。旧 `reports/**/suite.generated.json`
+只能作为历史参考，不能被默认复用为新评测配置。
+
 ## P1 插件合规要求
 
 ### P1-1 frontmatter 数组格式
@@ -114,6 +127,8 @@ license 是否为 `MIT` 取决于项目真实授权；没有授权文件前继�
    target 子进程不受污染。
 5. suite 路径解析测试：suite 位于输出目录时，case/adapter 相对路径
    仍按 suite 文件所在目录解析。
+6. benchmark 防退化测试：175-case 资产、分层数量、suite 覆盖和 eval
+   skill 防复用旧 4-case 报告产物策略必须被测试固定。
 
 测试可以用 `pytest`，必要时使用 Python 标准库 fallback，但仓库内必须
 提供可直接运行的测试文件。

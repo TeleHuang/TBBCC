@@ -81,3 +81,42 @@ def test_plugin_prompts_are_portable() -> None:
         text = path.read_text(encoding="utf-8")
         assert "/home/ma-user/work" not in text, f"{path} contains machine-specific path"
         assert not re.search(r"python\s+scripts/", text), f"{path} uses plugin script without CLAUDE_PLUGIN_ROOT"
+
+
+def test_eval_skill_guards_against_smoke_regression() -> None:
+    text = (ROOT / "skills" / "torchbridgebench" / "SKILL.md").read_text(encoding="utf-8")
+    required_phrases = [
+        "Treat existing files under `reports/` as historical artifacts",
+        "do not reuse `reports/**/adapter.generated.json`",
+        "all_noop.json",
+        "175 cases",
+        "L1=67, L2=42, L3=25, L4=41",
+        "do not silently downgrade to a 4-case smoke",
+        "Always state the benchmark scope and sample size",
+        "Full evaluation is the default; smoke/dev is opt-in",
+    ]
+    for phrase in required_phrases:
+        assert phrase in text
+
+
+def test_benchmark_assets_do_not_regress() -> None:
+    cases = list((ROOT / "benchmarks" / "v1.0.0" / "cases").rglob("*.json"))
+    assert len(cases) == 175
+
+    manifest = json.loads((ROOT / "benchmarks" / "v1.0.0" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["totals"]["total_cases"] == 175
+    assert manifest["totals"]["by_level"] == {"L1": 67, "L2": 42, "L3": 25, "L4": 41}
+
+    suites = ROOT / "benchmarks" / "v1.0.0" / "suites"
+    expected_counts = {
+        "all_noop.json": 175,
+        "l1_noop.json": 67,
+        "l2_noop.json": 42,
+        "l3_noop.json": 25,
+        "l4_noop.json": 41,
+        "smoke_noop.json": 4,
+        "dev_noop.json": 2,
+    }
+    for filename, count in expected_counts.items():
+        suite = json.loads((suites / filename).read_text(encoding="utf-8"))
+        assert len(suite.get("cases") or []) == count, filename

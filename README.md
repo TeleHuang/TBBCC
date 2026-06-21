@@ -37,6 +37,11 @@ Run an end-to-end bridge evaluation with natural language:
 /torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，参考 test_train_cnn.py 里的 default_env、loss_wrapper 和 Torch4msOptimizer 用法，输出到 reports/torch4ms_eval
 ```
 
+For a normal bridge evaluation, the plugin should create fresh run artifacts and
+default to the full 175-case benchmark unless you explicitly ask for a quick
+smoke/dev run. Existing `reports/**/suite.generated.json` files are historical
+outputs, not default input configurations.
+
 Claude Code 2.1.183 does not provide `claude plugin add`. Use `--plugin-dir`
 for local manual checks, or the marketplace/install workflow for packaged
 distribution.
@@ -85,8 +90,9 @@ benchmarks/v1.0.0/manifest.json
 Useful suites:
 
 - `benchmarks/v1.0.0/suites/dev_noop.json`: fast routine validation.
-- `benchmarks/v1.0.0/suites/smoke_noop.json`: cross-level smoke with L3/L4.
-- `benchmarks/v1.0.0/suites/all_noop.json`: full generated matrix.
+- `benchmarks/v1.0.0/suites/smoke_noop.json`: 4-case cross-level smoke only.
+- `benchmarks/v1.0.0/suites/all_noop.json`: full 175-case generated matrix for
+  normal bridge evaluation and final claims.
 
 Rebuild the library after editing the generator:
 

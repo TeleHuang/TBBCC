@@ -28,17 +28,24 @@ start from adapter authoring. Prefer natural language over CLI-style flags:
 The agent infers the bridge id, searches local bridge repositories, README/docs,
 examples, and `test_*.py` minimal cases, then writes:
 
-- `reports/torch4ms_eval/adapter.generated.json`
-- `reports/torch4ms_eval/effort_ledger.json`
-- `reports/torch4ms_eval/suite.generated.json`
-- `reports/torch4ms_eval/eval/summary.md`
-- `reports/torch4ms_eval/eval/summary.json`
+- `reports/<run>/adapter.generated.json`
+- `reports/<run>/effort_ledger.json`
+- `reports/<run>/suite.generated.json`
+- `reports/<run>/summary.md`
+- `reports/<run>/summary.json`
 
 Use this path for normal bridge evaluation. It records adapter creation as
 `Effort_adapt` and then runs the generated adapter through the benchmark suite.
 If documentation is missing but a minimal example exists, the agent should use
 the example as adapter evidence. If neither exists, it should ask for a minimal
 example, local docs, or online docs.
+
+By default, a normal bridge evaluation should use the full 175-case benchmark
+suite `benchmarks/v1.0.0/suites/all_noop.json`. The 4-case `smoke_noop.json`
+suite is only for explicit quick smoke checks and must be reported as such.
+Existing `reports/**/adapter.generated.json` and `reports/**/suite.generated.json`
+files are historical artifacts; do not reuse them unless you explicitly ask to
+resume or reuse them.
 
 ## Manual Run
 
@@ -131,8 +138,8 @@ Excluded:
 
 ## Recommended Workflow
 
-1. Run `dev_noop` or your smallest suite to validate adapter loading.
-2. Run `smoke_noop` or a bridge-specific smoke suite for L1/L2/L3/L4 coverage.
+1. Run `dev_noop` or your smallest suite only to validate adapter loading.
+2. Run `smoke_noop` only for a quick cross-level smoke check.
 3. Inspect `summary.md` first. Only open per-case reports for failures.
 4. Use `summary.json` to generate paper tables.
 5. For final claims, run the full benchmark suite and use the matching AR
