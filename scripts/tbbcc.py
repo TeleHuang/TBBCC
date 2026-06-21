@@ -9,7 +9,6 @@ the harness only requires the case to expose a JSON-normalizable RESULT or run()
 from __future__ import annotations
 
 import argparse
-import contextlib
 import dataclasses
 import datetime as _dt
 import importlib.util
@@ -351,183 +350,18 @@ def execute_python(role: str, preamble: str, code: str, env: dict[str, str], tim
     )
 
 
-def _pair_runner_source(source_preamble: str, target_preamble: str, code: str, target_env: dict[str, str], timeout: int) -> str:
-    return f"""import contextlib
-import io
-import json
-import math
-import os
-import signal
-import sys
-import time
-import traceback
-
-SOURCE_PREAMBLE = {source_preamble!r}
-TARGET_PREAMBLE = {target_preamble!r}
-CODE = {code!r}
-TARGET_ENV = {target_env!r}
-ROLE_TIMEOUT = {timeout!r}
-
-def _normalize(value):
-    if value is None or isinstance(value, (bool, int, float, str)):
-        if isinstance(value, float):
-            if math.isnan(value):
-                return {{"__float__": "nan"}}
-            if math.isinf(value):
-                return {{"__float__": "inf" if value > 0 else "-inf"}}
-        return value
-    if isinstance(value, dict):
-        return {{str(k): _normalize(v) for k, v in value.items()}}
-    if isinstance(value, (list, tuple)):
-        return [_normalize(v) for v in value]
-    if hasattr(value, "detach"):
-        value = value.detach()
-    if hasattr(value, "cpu"):
-        value = value.cpu()
-    if hasattr(value, "tolist"):
-        return _normalize(value.tolist())
-    if hasattr(value, "item"):
-        try:
-            return _normalize(value.item())
-        except Exception:
-            pass
-    return repr(value)
-
-class _RoleTimeout(Exception):
-    pass
-
-def _timeout_handler(signum, frame):
-    raise _RoleTimeout(f"Timeout after {{ROLE_TIMEOUT}}s")
-
-def _run_role(role, preamble, env_updates):
-    started = time.perf_counter()
-    ns = {{"__name__": "__main__"}}
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
-    previous_env = {{}}
-    added_keys = []
-    try:
-        for key, value in env_updates.items():
-            if key in os.environ:
-                previous_env[key] = os.environ[key]
-            else:
-                added_keys.append(key)
-            os.environ[key] = value
-        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(int(ROLE_TIMEOUT))
-        try:
-            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
-                if preamble:
-                    exec(preamble, ns)
-                exec(CODE, ns)
-                if "RESULT" in ns:
-                    result = ns["RESULT"]
-                elif "run" in ns and callable(ns["run"]):
-                    result = ns["run"]()
-                else:
-                    raise RuntimeError("Test code must define RESULT or run().")
-            payload = {{"result": _normalize(result)}}
-            if "ACTIVATIONS" in ns:
-                payload["activations"] = _normalize(ns["ACTIVATIONS"])
-            if "GRADIENTS" in ns:
-                payload["gradients"] = _normalize(ns["GRADIENTS"])
-            if "TASK_METRICS" in ns:
-                payload["task_metrics"] = _normalize(ns["TASK_METRICS"])
-            ok = True
-            returncode = 0
-            tb = None
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, old_handler)
-    except Exception:
-        payload = {{}}
-        ok = False
-        returncode = 1
-        tb = traceback.format_exc().strip()
-        stderr_buf.write(tb + "\\n")
-    finally:
-        for key, value in previous_env.items():
-            os.environ[key] = value
-        for key in added_keys:
-            os.environ.pop(key, None)
-    return {{
-        "role": role,
-        "ok": ok,
-        "result": payload.get("result"),
-        "activations": payload.get("activations"),
-        "gradients": payload.get("gradients"),
-        "task_metrics": payload.get("task_metrics"),
-        "returncode": returncode,
-        "duration_seconds": time.perf_counter() - started,
-        "stdout": stdout_buf.getvalue(),
-        "stderr": stderr_buf.getvalue(),
-        "traceback": tb,
-    }}
-
-pair = {{
-    "source": _run_role("source", SOURCE_PREAMBLE, {{}}),
-    "target": _run_role("target", TARGET_PREAMBLE, TARGET_ENV),
-}}
-print("TBBCC_PAIR_JSON=" + json.dumps(pair, sort_keys=True))
-"""
-
-
-def _extract_pair_payload(stdout: str) -> Any:
-    prefix = "TBBCC_PAIR_JSON="
-    for line in reversed(stdout.splitlines()):
-        if line.startswith(prefix):
-            return json.loads(line[len(prefix) :])
-    return _MISSING
-
-
 def execute_python_pair(source_preamble: str, target_preamble: str, code: str, env: dict[str, str], timeout: int) -> tuple[ExecResult, ExecResult]:
-    source = _runner_source(source_preamble, code)
-    target = _runner_source(target_preamble, code)
-    if not source_preamble and not target_preamble and not env:
-        pass
-    pair_source = _pair_runner_source(source_preamble, target_preamble, code, env, timeout)
-    start = _dt.datetime.now(_dt.UTC)
-    with tempfile.TemporaryDirectory(prefix="tbbcc_pair_") as td:
-        script = Path(td) / "pair.py"
-        script.write_text(pair_source, encoding="utf-8")
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(script)],
-                text=True,
-                capture_output=True,
-                env=os.environ.copy(),
-                timeout=max(timeout * 2 + 5, timeout + 5),
-            )
-        except subprocess.TimeoutExpired as exc:
-            end = _dt.datetime.now(_dt.UTC)
-            duration = (end - start).total_seconds()
-            timeout_text = f"Timeout after {timeout}s"
-            src = ExecResult("source", False, None, None, None, None, 124, duration, _coerce_text(exc.stdout), _coerce_text(exc.stderr) or timeout_text, timeout_text)
-            tgt = ExecResult("target", False, None, None, None, None, 124, duration, _coerce_text(exc.stdout), _coerce_text(exc.stderr) or timeout_text, timeout_text)
-            return src, tgt
-    payload = _extract_pair_payload(proc.stdout)
-    if payload is _MISSING:
-        fallback = ExecResult("source", False, None, None, None, None, proc.returncode, 0.0, proc.stdout, proc.stderr, _extract_traceback(proc.stderr))
-        fallback_target = dataclasses.replace(fallback, role="target")
-        return fallback, fallback_target
+    """Execute source and target in separate Python subprocesses.
 
-    def _convert(role: str) -> ExecResult:
-        item = payload.get(role) or {}
-        return ExecResult(
-            role=role,
-            ok=bool(item.get("ok")),
-            result=item.get("result"),
-            activations=item.get("activations"),
-            gradients=item.get("gradients"),
-            task_metrics=item.get("task_metrics"),
-            returncode=int(item.get("returncode", 1)),
-            duration_seconds=float(item.get("duration_seconds", 0.0)),
-            stdout=_coerce_text(item.get("stdout")),
-            stderr=_coerce_text(item.get("stderr")),
-            traceback=item.get("traceback"),
-        )
-
-    return _convert("source"), _convert("target")
+    Bridge adapters can be import-order sensitive. Keeping both roles in one
+    interpreter lets source-side PyTorch imports, sys.modules mutations, global
+    device state, or environment edits leak into target initialization. The
+    benchmark measures bridge compatibility, not contamination by the harness,
+    so isolation is the default.
+    """
+    source = execute_python("source", source_preamble, code, {}, timeout)
+    target = execute_python("target", target_preamble, code, env, timeout)
+    return source, target
 
 
 class _Missing:

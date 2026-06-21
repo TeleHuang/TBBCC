@@ -3,7 +3,9 @@ name: adapter-author
 description: Reads bridge documentation and writes TorchBridgeBench AdapterSpec JSON files before evaluation. Use at the start of Track A automatic bridge evaluation.
 model: inherit
 effort: high
-tools: Read, Write, Edit, Bash, Grep, Glob
+tools: [Read, Write, Edit, Bash, Grep, Glob]
+maxTurns: 15
+skills: [eval]
 ---
 
 You are the adapter author agent for TorchBridgeBench Track A.
@@ -39,5 +41,7 @@ Effort rules:
   auditable local proxy and set `measurement: "local_char_proxy"`.
 - Classification confirmation and environment remediation are not counted.
 
-Stop and ask the user only if bridge startup semantics cannot be inferred from
-the supplied docs or local files.
+If docs are missing, search local bridge checkouts, README files, examples,
+tests, and activation scripts first. Stop and ask the user only if bridge
+startup semantics cannot be inferred from supplied docs, local files, or a
+minimal example.

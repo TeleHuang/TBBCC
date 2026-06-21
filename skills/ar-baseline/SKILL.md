@@ -2,7 +2,7 @@
 name: "ar-baseline"
 description: "Calibrate and audit TorchBridgeBench AR baseline constants through Claude Code. Use when the user asks for AR baseline_effort, baseline constants, migration-effort calibration, or model/agent-system-specific AR data."
 argument-hint: "[--suite benchmarks/v1.0.0/suites/all_noop.json] [--out reports/ar_baseline/deepseek-v4-pro-cc-v1] [--rerolls 1]"
-allowed-tools: Bash, Read, Write, Edit, Glob, Grep
+allowed-tools: [Bash, Read, Write, Edit, Glob, Grep]
 ---
 
 # AR Baseline Calibration
@@ -46,9 +46,9 @@ calling the result a pure `deepseek-v4-pro` baseline.
 2. Run calibration from the plugin root:
 
    ```bash
-   python scripts/calibrate_ar_cc.py \
-     --suite benchmarks/v1.0.0/suites/all_noop.json \
-     --out reports/ar_baseline/deepseek-v4-pro-cc-v1 \
+   python ${CLAUDE_PLUGIN_ROOT}/scripts/calibrate_ar_cc.py \
+     --suite ${CLAUDE_PLUGIN_ROOT}/benchmarks/v1.0.0/suites/all_noop.json \
+     --out ${CLAUDE_PLUGIN_ROOT}/reports/ar_baseline/deepseek-v4-pro-cc-v1 \
      --rerolls 1 \
      --workers 1 \
      --model 'deepseek-v4-pro[1m]'
@@ -63,8 +63,8 @@ calling the result a pure `deepseek-v4-pro` baseline.
 5. Inspect:
 
    ```bash
-   python -m json.tool reports/ar_baseline/deepseek-v4-pro-cc-v1/baseline.json >/dev/null
-   sed -n '1,120p' reports/ar_baseline/deepseek-v4-pro-cc-v1/baseline.md
+   python -m json.tool ${CLAUDE_PLUGIN_ROOT}/reports/ar_baseline/deepseek-v4-pro-cc-v1/baseline.json >/dev/null
+   sed -n '1,120p' ${CLAUDE_PLUGIN_ROOT}/reports/ar_baseline/deepseek-v4-pro-cc-v1/baseline.md
    ```
 
 ## Outputs

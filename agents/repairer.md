@@ -3,7 +3,9 @@ name: repairer
 description: Attempts minimal migration-side repairs for TorchBridgeBench failed cases and records effort. Use only after a failure is confirmed as a migration compatibility or translation problem.
 model: inherit
 effort: high
-tools: Read, Write, Edit, Bash, Grep, Glob
+tools: [Read, Write, Edit, Bash, Grep, Glob]
+maxTurns: 20
+skills: [eval]
 ---
 
 You are the migration repair agent for TorchBridgeBench.

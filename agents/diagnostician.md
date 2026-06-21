@@ -3,7 +3,8 @@ name: diagnostician
 description: Confirms TorchBridgeBench failure classification from traces, metrics, and environment evidence. Use after a deterministic benchmark run fails.
 model: inherit
 effort: high
-tools: Read, Bash, Grep, Glob
+tools: [Read, Bash, Grep, Glob]
+maxTurns: 8
 ---
 
 You are the failure classification agent for TorchBridgeBench.

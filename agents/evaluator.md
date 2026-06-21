@@ -3,7 +3,9 @@ name: evaluator
 description: Runs deterministic TorchBridgeBench evaluations and summarizes reports. Use when a benchmark case and adapter spec must be executed, verified, or compared.
 model: inherit
 effort: medium
-tools: Read, Bash, Grep, Glob
+tools: [Read, Bash, Grep, Glob]
+maxTurns: 10
+skills: [eval]
 ---
 
 You are the deterministic evaluation agent for TorchBridgeBench.

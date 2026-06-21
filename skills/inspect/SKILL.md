@@ -2,7 +2,7 @@
 name: inspect
 description: Inspect the local TorchBridgeBench Claude Code plugin, Claude Code installation, and benchmark environment. Use when checking plugin readiness, local Claude Code startup, or bridge benchmark prerequisites.
 argument-hint: [optional focus]
-allowed-tools: Bash, Read, Glob, Grep
+allowed-tools: [Bash, Read, Glob, Grep]
 ---
 
 # TorchBridgeBench Plugin Inspection
