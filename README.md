@@ -37,10 +37,11 @@ Run an end-to-end bridge evaluation with natural language:
 /torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，参考 test_train_cnn.py 里的 default_env、loss_wrapper 和 Torch4msOptimizer 用法，输出到 reports/torch4ms_eval
 ```
 
-For a normal bridge evaluation, the plugin should create fresh run artifacts and
-default to the full 175-case benchmark unless you explicitly ask for a quick
-smoke/dev run. Existing `reports/**/suite.generated.json` files are historical
-outputs, not default input configurations.
+For a normal bridge evaluation, the plugin defaults to reusing a valid cached
+`adapter.generated.json` + `suite.generated.json` from `reports/` when bridge id
+and suite scope match. Say `fresh`, `regenerate`, `no-cache`, or `重新生成` when
+you want new artifacts. If no suite is specified, the default scope remains the
+full 175-case benchmark unless you explicitly ask for a quick smoke/dev run.
 
 Claude Code 2.1.183 does not provide `claude plugin add`. Use `--plugin-dir`
 for local manual checks, or the marketplace/install workflow for packaged

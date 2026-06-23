@@ -32,23 +32,33 @@ Read these files before nontrivial work:
      found bridge checkouts;
    - `${CLAUDE_PLUGIN_ROOT}/../-demo/examples/<bridge>_adapter.json` when it
      exists.
-3. Treat existing files under `reports/` as historical artifacts. Read them for
-   context if useful, but do not reuse `reports/**/adapter.generated.json` or
-   `reports/**/suite.generated.json` as the current run configuration unless
-   the user explicitly asks to resume or reuse that exact artifact.
-4. If a complete user-supplied AdapterSpec exists outside historical reports,
+3. Default to cache reuse. Before generating adapter/suite files, look for a
+   reusable cache under `reports/` by running:
+
+   ```bash
+   python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py cache-status --bridge-id <bridge> --suite <selected-suite> --reports-root ${CLAUDE_PLUGIN_ROOT}/reports
+   ```
+
+   A reusable cache must match the requested bridge id and selected suite scope
+   by case ids/case count. Prefer the newest valid match. Reuse its
+   `adapter.generated.json` and `suite.generated.json` by default, and say
+   which cache directory was reused.
+4. Explicitly skip cache only when the user asks for fresh generation, for
+   example `fresh`, `regenerate`, `no-cache`, `重新生成`, `不要缓存`, or
+   `重新写 adapter/suite`. In that case create new adapter/suite artifacts.
+5. If there is no valid cache, but a complete user-supplied AdapterSpec exists,
    validate it. Otherwise create a fresh adapter in the requested output
    directory from the discovered docs or minimal example, and record
    adapter-authoring effort in an effort ledger. Environment remediation is not
    counted as effort.
-5. For bridges with a reference adapter under
+6. For bridges with a reference adapter under
    `${CLAUDE_PLUGIN_ROOT}/../-demo/examples/<bridge>_adapter.json`, use it as
    high-priority evidence. Preserve backend configuration semantics such as
    torch4ms `Configuration.default_device_target`, `TORCH4MS_DEVICE_TARGET`, and
    required activation/PYTHONPATH notes. Do not replace a reference adapter with
    a weaker bare import/default context unless you explicitly justify the
    difference.
-6. Before running a large suite, run a tiny adapter/backend sanity check:
+7. Before running a large suite, run a tiny adapter/backend sanity check:
    - verify the bridge imports in the same environment that will run the suite;
    - verify the actual backend/device selected by the bridge;
    - for torch4ms, inspect the `Initialized MindSpore with configuration`
@@ -57,7 +67,7 @@ Read these files before nontrivial work:
    environment remediation. If it remains CPU, clearly label the run as a CPU
    backend diagnostic (`CPU backend diagnostic`) and do not present it as the bridge's intended NPU
    compatibility result.
-7. Select benchmark scope explicitly:
+8. Select benchmark scope explicitly:
    - If the user names a suite, use that suite.
    - If the user asks for a quick smoke/dev check, use `smoke_noop.json` or
      `dev_noop.json` and state the small case count clearly.
@@ -65,34 +75,37 @@ Read these files before nontrivial work:
      for a full benchmark run. The benchmark asset baseline is 175 cases
      (L1=67, L2=42, L3=25, L4=41); do not silently downgrade to a 4-case smoke
      suite for a normal bridge evaluation.
-8. Use a fresh output directory by default. If the user gives `reports/<name>`
-   and it already contains generated artifacts, create a timestamped child or
-   sibling such as `reports/<name>_<YYYYmmdd_HHMMSS>` unless the user explicitly
-   says to overwrite, resume, or reuse.
-9. Generate a suite for the fresh adapter by copying the selected benchmark
-   scope and replacing only the adapter path.
-10. Run:
+9. Output policy:
+   - If reusing a cache and the user did not request a new output directory, run
+     from the cache directory or its `eval/` child as appropriate.
+   - If generating fresh artifacts, use the requested output directory. If it
+     already contains generated artifacts, create a timestamped child or sibling
+     unless the user explicitly says to overwrite.
+10. If generating fresh artifacts, generate a suite by copying the selected
+    benchmark scope and replacing only the adapter path.
+11. Run:
 
    ```bash
    python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval-suite --suite <suite.json> --out <out-dir>
    ```
 
-11. For a single explicit case, run:
+12. For a single explicit case, run:
 
    ```bash
    python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval --case <case.json> --adapter <adapter.json> --out <out-dir>
    ```
 
-12. Read the generated report or summary before concluding.
-13. Always state the benchmark scope, sample size, and actual backend/device in
+13. Read the generated report or summary before concluding.
+14. Always state whether cache was reused or fresh artifacts were generated.
+15. Always state the benchmark scope, sample size, and actual backend/device in
     the final response. If simple cases such as ReLU or reshape fail with broad
     NumericMismatch and cosine near zero, audit adapter/backend configuration
     before concluding the bridge is internally wrong.
-14. Always state the benchmark scope and sample size in the final response, for
+16. Always state the benchmark scope and sample size in the final response, for
     example `0/4 smoke cases` versus `160/175 full benchmark cases`. Never imply
     that a smoke result represents the full benchmark.
-15. Confirm failure classification before repair when the result is nontrivial.
-16. Repair only migration-side files unless the user explicitly asks for bridge
+17. Confirm failure classification before repair when the result is nontrivial.
+18. Repair only migration-side files unless the user explicitly asks for bridge
    internals.
 
 ## Constraints
@@ -105,3 +118,5 @@ Read these files before nontrivial work:
   documentation instead of failing immediately.
 - Do not allow the 175-case benchmark asset to become invisible through
   convenience defaults. Full evaluation is the default; smoke/dev is opt-in.
+- Do not regenerate adapter/suite files when a valid cache exists unless the
+  user explicitly asks for regeneration.

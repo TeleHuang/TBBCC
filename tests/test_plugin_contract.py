@@ -86,8 +86,12 @@ def test_plugin_prompts_are_portable() -> None:
 def test_eval_skill_guards_against_smoke_regression() -> None:
     text = (ROOT / "skills" / "torchbridgebench" / "SKILL.md").read_text(encoding="utf-8")
     required_phrases = [
-        "Treat existing files under `reports/` as historical artifacts",
-        "do not reuse `reports/**/adapter.generated.json`",
+        "Default to cache reuse",
+        "cache-status",
+        "Explicitly skip cache",
+        "fresh",
+        "regenerate",
+        "重新生成",
         "all_noop.json",
         "175 cases",
         "L1=67, L2=42, L3=25, L4=41",

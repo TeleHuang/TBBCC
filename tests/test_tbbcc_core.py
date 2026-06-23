@@ -134,3 +134,67 @@ def test_run_eval_with_generated_suite_relative_paths(tmp_path: Path) -> None:
     assert tbbcc.cmd_eval_suite(args) == 0
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["totals"]["passed"] == 1
+
+
+def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:
+    case = tmp_path / "benchmarks" / "case.json"
+    suite = tmp_path / "benchmarks" / "suite.json"
+    cache = tmp_path / "reports" / "identity_eval_cache"
+    case.parent.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    case.write_text(
+        json.dumps(
+            {
+                "id": "unit/cache",
+                "level": "L1",
+                "track": "unit",
+                "code": "RESULT = 1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "cache_scope", "cases": ["case.json"], "adapters": []}), encoding="utf-8")
+    (cache / "adapter.generated.json").write_text(
+        json.dumps({"bridge_id": "identity", "track": "intercept", "preamble": ""}),
+        encoding="utf-8",
+    )
+    (cache / "suite.generated.json").write_text(
+        json.dumps(
+            {
+                "suite_id": "cache_scope_generated",
+                "cases": ["../../benchmarks/case.json"],
+                "adapters": ["adapter.generated.json"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    matches = tbbcc.find_eval_caches("identity", tmp_path / "reports", suite)
+    assert len(matches) == 1
+    assert matches[0]["cache_dir"] == str(cache.resolve())
+    assert matches[0]["case_count"] == 1
+
+    assert tbbcc.find_eval_caches("other_bridge", tmp_path / "reports", suite) == []
+
+
+def test_find_eval_caches_rejects_weak_torch4ms_cache(tmp_path: Path) -> None:
+    case = tmp_path / "benchmarks" / "case.json"
+    suite = tmp_path / "benchmarks" / "suite.json"
+    cache = tmp_path / "reports" / "torch4ms_weak_cache"
+    case.parent.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    case.write_text(
+        json.dumps({"id": "unit/cache", "level": "L1", "track": "unit", "code": "RESULT = 1"}),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "cache_scope", "cases": ["case.json"], "adapters": []}), encoding="utf-8")
+    (cache / "adapter.generated.json").write_text(
+        json.dumps({"bridge_id": "torch4ms", "track": "intercept", "preamble": "import torch4ms\n_env = torch4ms.default_env()\n_env.__enter__()\n"}),
+        encoding="utf-8",
+    )
+    (cache / "suite.generated.json").write_text(
+        json.dumps({"suite_id": "cache_scope_generated", "cases": ["../../benchmarks/case.json"], "adapters": ["adapter.generated.json"]}),
+        encoding="utf-8",
+    )
+
+    assert tbbcc.find_eval_caches("torch4ms", tmp_path / "reports", suite) == []

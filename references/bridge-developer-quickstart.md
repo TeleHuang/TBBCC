@@ -25,8 +25,10 @@ start from adapter authoring. Prefer natural language over CLI-style flags:
 /torchbridgebench:eval 评测 torch4ms，优先从本机 ascend-torch4ms-ms272-stable 找文档或最小用例，输出到 reports/torch4ms_eval
 ```
 
-The agent infers the bridge id, searches local bridge repositories, README/docs,
-examples, and `test_*.py` minimal cases, then writes:
+The agent infers the bridge id, selects the benchmark scope, and first checks
+for a reusable generated adapter/suite cache. If a valid cache exists, it reuses
+it by default. If no valid cache exists, it searches local bridge repositories,
+README/docs, examples, and `test_*.py` minimal cases, then writes:
 
 - `reports/<run>/adapter.generated.json`
 - `reports/<run>/effort_ledger.json`
@@ -44,8 +46,9 @@ By default, a normal bridge evaluation should use the full 175-case benchmark
 suite `benchmarks/v1.0.0/suites/all_noop.json`. The 4-case `smoke_noop.json`
 suite is only for explicit quick smoke checks and must be reported as such.
 Existing `reports/**/adapter.generated.json` and `reports/**/suite.generated.json`
-files are historical artifacts; do not reuse them unless you explicitly ask to
-resume or reuse them.
+files are reusable caches only when `cache-status` confirms that bridge id and
+suite case ids match the requested evaluation. Say `fresh`, `regenerate`,
+`no-cache`, or `重新生成` when you want to force new adapter/suite generation.
 
 For bridges that ship a reference adapter example under `../-demo/examples`,
 the automatic workflow should use it as high-priority evidence. For torch4ms,

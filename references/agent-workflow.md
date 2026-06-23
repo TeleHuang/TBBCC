@@ -26,13 +26,16 @@ core. If no docs or minimal examples can be found, it asks the user for one of
 those inputs instead of failing on a missing placeholder path.
 
 Regression guard: normal bridge evaluation must not silently collapse to the
-4-case `smoke_noop` suite or reuse stale `reports/**/suite.generated.json`
-artifacts. Historical reports can inform diagnosis, but every new natural
-language eval should create fresh adapter/suite artifacts unless the user
-explicitly asks to resume or reuse. When the user does not specify a suite and
-does not request a quick smoke/dev run, default to the full benchmark
+4-case `smoke_noop` suite. Cache reuse is the default, but only for validated
+generated artifacts whose bridge id and suite case ids match the requested
+evaluation. Use `scripts/tbbcc.py cache-status` to find candidates. If the user
+does not specify a suite and does not request a quick smoke/dev run, default to
+the full benchmark
 `benchmarks/v1.0.0/suites/all_noop.json` covering 175 cases (L1=67, L2=42,
-L3=25, L4=41). Always state the evaluated case count in the final summary.
+L3=25, L4=41). Always state the evaluated case count and whether cache was
+reused in the final summary. Only regenerate adapter/suite artifacts when no
+valid cache exists or when the user explicitly asks for fresh/no-cache/
+regenerate/重新生成 behavior.
 
 Adapter/backend guard: normal bridge evaluation must not silently replace a
 reference adapter with a weaker ad-hoc preamble. If `../-demo/examples` contains

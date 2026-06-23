@@ -58,8 +58,9 @@ Claude Code 插件的结构、易用入口、测试基础和评测运行正确�
 - `smoke_noop.json` 只是 4-case 快速检查，不能作为普通桥接器评测默认值。
 
 自然语言 `/torchbridgebench:eval` 在用户未指定 suite 且未要求 quick
-smoke/dev 时，必须默认选择 full benchmark。旧 `reports/**/suite.generated.json`
-只能作为历史参考，不能被默认复用为新评测配置。
+smoke/dev 时，必须默认选择 full benchmark。系统默认复用已验证缓存；缓存
+必须匹配 bridge id 与 suite case ids/case count。只有当没有有效缓存，或
+用户明确要求 fresh/no-cache/regenerate/重新生成时，才重新生成 adapter/suite。
 
 ## P1 插件合规要求
 

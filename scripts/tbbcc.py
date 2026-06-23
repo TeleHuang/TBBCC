@@ -1362,6 +1362,110 @@ def cmd_plot_reports(args: argparse.Namespace) -> int:
     return 0
 
 
+def _suite_case_ids(suite_path: Path) -> tuple[list[str], list[str]]:
+    suite = _load_json(suite_path)
+    cases = suite.get("cases") or []
+    if not isinstance(cases, list):
+        return [], [f"Suite {suite_path} cases must be a list"]
+    ids: list[str] = []
+    errors: list[str] = []
+    for case_item in cases:
+        case_path = _resolve_path(suite_path.parent, str(case_item))
+        try:
+            ids.append(load_case(case_path).id)
+        except BaseException as exc:
+            errors.append(f"{case_item}: {exc}")
+    return ids, errors
+
+
+def find_eval_caches(
+    bridge_id: str,
+    reports_root: Path,
+    suite_path: Path | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    expected_ids: list[str] | None = None
+    if suite_path is not None:
+        expected_ids, errors = _suite_case_ids(suite_path)
+        if errors:
+            raise SystemExit(f"Cannot inspect suite {suite_path}: {errors[0]}")
+    matches: list[dict[str, Any]] = []
+    if not reports_root.exists():
+        return matches
+    for generated_suite in reports_root.rglob("suite.generated.json"):
+        cache_dir = generated_suite.parent
+        adapter_path = cache_dir / "adapter.generated.json"
+        if not adapter_path.exists():
+            continue
+        try:
+            adapter = load_adapter(adapter_path)
+            case_ids, errors = _suite_case_ids(generated_suite)
+        except BaseException:
+            continue
+        if errors or adapter.bridge_id != bridge_id:
+            continue
+        quality_warnings = _cache_quality_warnings(adapter)
+        if quality_warnings:
+            continue
+        scope_match = True
+        if expected_ids is not None:
+            scope_match = case_ids == expected_ids
+        summary_path = cache_dir / "summary.json"
+        if not summary_path.exists() and (cache_dir / "eval" / "summary.json").exists():
+            summary_path = cache_dir / "eval" / "summary.json"
+        matches.append(
+            {
+                "cache_dir": str(cache_dir.resolve()),
+                "adapter_path": str(adapter_path.resolve()),
+                "suite_path": str(generated_suite.resolve()),
+                "summary_path": str(summary_path.resolve()) if summary_path.exists() else None,
+                "bridge_id": adapter.bridge_id,
+                "case_count": len(case_ids),
+                "scope_match": scope_match,
+                "quality_warnings": quality_warnings,
+                "mtime": generated_suite.stat().st_mtime,
+            }
+        )
+    matches = [item for item in matches if item["scope_match"]]
+    matches.sort(key=lambda item: item["mtime"], reverse=True)
+    return matches[:limit]
+
+
+def _cache_quality_warnings(adapter: AdapterSpec) -> list[str]:
+    warnings: list[str] = []
+    preamble = adapter.preamble or ""
+    if adapter.bridge_id == "torch4ms":
+        if "TORCH4MS_DEVICE_TARGET" not in preamble and "TORCH4MS_DEVICE_TARGET" not in adapter.env:
+            warnings.append("torch4ms cache does not configure TORCH4MS_DEVICE_TARGET")
+        if "Configuration" not in preamble or "default_device_target" not in preamble:
+            warnings.append("torch4ms cache does not configure torch4ms Configuration.default_device_target")
+    return warnings
+
+
+def cmd_cache_status(args: argparse.Namespace) -> int:
+    matches = find_eval_caches(
+        bridge_id=str(args.bridge_id),
+        reports_root=Path(args.reports_root).resolve(),
+        suite_path=Path(args.suite).resolve() if args.suite else None,
+        limit=int(args.limit),
+    )
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "bridge_id": args.bridge_id,
+                "suite": str(Path(args.suite).resolve()) if args.suite else None,
+                "reports_root": str(Path(args.reports_root).resolve()),
+                "match_count": len(matches),
+                "matches": matches,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tbbcc", description="TorchBridgeBench Claude Code plugin core")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1447,6 +1551,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate GPU ground-truth coverage and artifact-completeness figure",
     )
     p_plot.set_defaults(func=cmd_plot_reports)
+
+    p_cache = sub.add_parser("cache-status", help="Find reusable generated adapter/suite caches")
+    p_cache.add_argument("--bridge-id", required=True, help="Bridge id to match in adapter.generated.json")
+    p_cache.add_argument("--suite", default=None, help="Optional benchmark suite whose case ids must match")
+    p_cache.add_argument("--reports-root", default="reports", help="Reports directory to scan")
+    p_cache.add_argument("--limit", type=int, default=10, help="Maximum matching caches to return")
+    p_cache.set_defaults(func=cmd_cache_status)
     return parser
 
 
