@@ -4,11 +4,14 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import tbbcc  # noqa: E402
+import tbbcc_gpu_reference  # noqa: E402
 
 
 def test_resolve_path_uses_suite_parent(tmp_path: Path) -> None:
@@ -134,6 +137,440 @@ def test_run_eval_with_generated_suite_relative_paths(tmp_path: Path) -> None:
     assert tbbcc.cmd_eval_suite(args) == 0
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["totals"]["passed"] == 1
+
+
+def test_large_tensor_report_is_compact(tmp_path: Path) -> None:
+    case = tmp_path / "case.json"
+    adapter = tmp_path / "adapter.json"
+    out = tmp_path / "out"
+    case.write_text(
+        json.dumps(
+            {
+                "id": "unit/large_tensor",
+                "level": "L1",
+                "track": "unit",
+                "code": "\n".join(
+                    [
+                        "import torch",
+                        "RESULT = torch.arange(200000, dtype=torch.float32).reshape(400, 500)",
+                    ]
+                ),
+                "expected_ops": [],
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": "identity",
+                "track": "intercept",
+                "preamble": "",
+                "source_preamble": "",
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = tbbcc.run_eval(case, adapter, out)
+    report_path = Path(report["_paths"]["report_json"])
+    assert report["final_state"] == "ALL_PASS"
+    assert report_path.stat().st_size < 250_000
+    stored = json.loads(report_path.read_text(encoding="utf-8"))
+    source_result = stored["tiers"]["T1"]["source"]["result"]
+    target_result = stored["tiers"]["T1"]["target"]["result"]
+    assert source_result["__tbbcc_tensor_summary__"] is True
+    assert target_result["__tbbcc_tensor_summary__"] is True
+    assert source_result["shape"] == [400, 500]
+    assert len(source_result["sha256"]) == 64
+    assert "artifact_path" not in json.dumps(stored)
+    assert not (out / "artifacts").exists()
+    assert "TBBCC_PAYLOAD_JSON" not in stored["tiers"]["T1"]["source"]["stdout"]
+
+
+def test_complex_tensor_comparison_uses_imaginary_part(tmp_path: Path) -> None:
+    case = tmp_path / "case.json"
+    adapter = tmp_path / "adapter.json"
+    out = tmp_path / "out"
+    case.write_text(
+        json.dumps(
+            {
+                "id": "unit/complex_tensor",
+                "level": "L1",
+                "track": "unit",
+                "code": "import torch\nRESULT = torch.tensor([1+2j, 3+4j], dtype=torch.complex64)",
+                "expected_ops": [],
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": "imaginary_drift",
+                "track": "intercept",
+                "preamble": "import torch\n_orig_tensor = torch.tensor\ndef _tensor(*args, **kwargs):\n    value = _orig_tensor(*args, **kwargs)\n    return value + _orig_tensor([0+1j, 0+0j], dtype=value.dtype) if value.is_complex() else value\ntorch.tensor = _tensor\n",
+                "source_preamble": "",
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = tbbcc.run_eval(case, adapter, out)
+    metrics = report["tiers"]["T1"]["metrics"]
+    assert report["final_state"] == "MARK_UNFIXABLE"
+    assert metrics["reason"] == "NumericMismatch"
+    assert metrics["max_error"] == 1.0
+
+
+def test_eval_suite_resumes_existing_reports_by_default(tmp_path: Path) -> None:
+    case = tmp_path / "case.json"
+    adapter = tmp_path / "adapter.json"
+    suite = tmp_path / "suite.json"
+    out = tmp_path / "out"
+    marker = tmp_path / "executions.txt"
+    case.write_text(
+        json.dumps(
+            {
+                "id": "unit/resume",
+                "level": "L1",
+                "track": "unit",
+                "code": f"from pathlib import Path\nPath({str(marker)!r}).write_text(Path({str(marker)!r}).read_text() + 'x' if Path({str(marker)!r}).exists() else 'x')\nRESULT = 1",
+                "expected_ops": [],
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": "identity",
+                "track": "intercept",
+                "preamble": "",
+                "source_preamble": "",
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(
+        json.dumps({"suite_id": "resume_test", "cases": [str(case)], "adapters": [str(adapter)]}),
+        encoding="utf-8",
+    )
+
+    class Args:
+        effort_ledger = None
+        ar_baseline = None
+        timeout = None
+        atol = None
+        rtol = None
+        no_resume = False
+
+    args = Args()
+    args.suite = str(suite)
+    args.out = str(out)
+
+    assert tbbcc.cmd_eval_suite(args) == 0
+    first_marker = marker.read_text(encoding="utf-8")
+    assert first_marker == "xx"
+    assert tbbcc.cmd_eval_suite(args) == 0
+    assert marker.read_text(encoding="utf-8") == first_marker
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["completed"] == 1
+    assert summary["totals"]["executed"] == 0
+    assert summary["totals"]["skipped"] == 1
+
+    args.no_resume = True
+    assert tbbcc.cmd_eval_suite(args) == 0
+    assert marker.read_text(encoding="utf-8") == "xxxx"
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["executed"] == 1
+    assert summary["totals"]["skipped"] == 0
+
+
+def test_eval_suite_ignores_oversized_legacy_report_for_resume(tmp_path: Path) -> None:
+    case = tmp_path / "case.json"
+    adapter = tmp_path / "adapter.json"
+    suite = tmp_path / "suite.json"
+    out = tmp_path / "out"
+    marker = tmp_path / "executions.txt"
+    case_id = "unit/oversized_resume"
+    bridge_id = "identity"
+    case.write_text(
+        json.dumps(
+            {
+                "id": case_id,
+                "level": "L1",
+                "track": "unit",
+                "code": f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\nRESULT = 1",
+                "expected_ops": [],
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": bridge_id,
+                "track": "intercept",
+                "preamble": "",
+                "source_preamble": "",
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "oversized_resume", "cases": [str(case)], "adapters": [str(adapter)]}), encoding="utf-8")
+    run_dir = out / "runs" / f"{tbbcc._slug(case_id)}__{tbbcc._slug(bridge_id)}"
+    run_dir.mkdir(parents=True)
+    report = run_dir / "report.json"
+    with report.open("wb") as f:
+        f.seek(tbbcc._MAX_RESUMABLE_REPORT_BYTES + 1)
+        f.write(b"{}")
+
+    class Args:
+        effort_ledger = None
+        ar_baseline = None
+        timeout = None
+        atol = None
+        rtol = None
+        no_resume = False
+
+    args = Args()
+    args.suite = str(suite)
+    args.out = str(out)
+
+    assert tbbcc.cmd_eval_suite(args) == 0
+    assert marker.read_text(encoding="utf-8") == "executed"
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["executed"] == 1
+    assert summary["totals"]["skipped"] == 0
+
+
+def test_eval_suite_uses_persistent_workers_by_default(tmp_path: Path) -> None:
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+    adapter = tmp_path / "adapter.json"
+    suite = tmp_path / "suite.json"
+    out = tmp_path / "out"
+    init_marker = tmp_path / "init_counts.json"
+    body_marker = tmp_path / "body_counts.json"
+    body_code = f"""
+import json
+from pathlib import Path
+marker = Path({str(body_marker)!r})
+data = json.loads(marker.read_text()) if marker.exists() else {{"count": 0}}
+data["count"] += 1
+marker.write_text(json.dumps(data))
+RESULT = 1
+"""
+    case_paths = []
+    for idx in range(2):
+        case = cases_dir / f"case{idx}.json"
+        case.write_text(
+            json.dumps(
+                {
+                    "id": f"unit/persistent/{idx}",
+                    "level": "L1",
+                    "track": "unit",
+                    "code": body_code,
+                    "expected_ops": [],
+                    "ground_truth": {"atol": 0.0, "rtol": 0.0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        case_paths.append(str(case))
+    preamble = f"""
+import json
+from pathlib import Path
+marker = Path({str(init_marker)!r})
+data = json.loads(marker.read_text()) if marker.exists() else {{"source": 0, "target": 0}}
+data[ROLE] += 1
+marker.write_text(json.dumps(data))
+"""
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": "identity",
+                "track": "intercept",
+                "preamble": "ROLE = 'target'\n" + preamble,
+                "source_preamble": "ROLE = 'source'\n" + preamble,
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "persistent_worker", "cases": case_paths, "adapters": [str(adapter)]}), encoding="utf-8")
+
+    class Args:
+        effort_ledger = None
+        ar_baseline = None
+        timeout = None
+        atol = None
+        rtol = None
+        no_resume = True
+        isolated_per_case = False
+
+    args = Args()
+    args.suite = str(suite)
+    args.out = str(out)
+
+    assert tbbcc.cmd_eval_suite(args) == 0
+    assert json.loads(init_marker.read_text(encoding="utf-8")) == {"source": 1, "target": 1}
+    assert json.loads(body_marker.read_text(encoding="utf-8")) == {"count": 4}
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["worker_mode"] == "persistent"
+
+
+def test_persistent_worker_ignores_non_protocol_stdout(tmp_path: Path) -> None:
+    worker = tbbcc.PersistentPythonWorker(
+        "source",
+        "print('mindspore runtime banner before init')",
+        {},
+        timeout=10,
+        artifact_root=tmp_path / "workers",
+    )
+    try:
+        result = worker.run_case(
+            "print('torch4ms runtime banner before result')\nRESULT = {'ok': True}",
+            tmp_path / "artifacts",
+        )
+    finally:
+        worker.close()
+
+    assert result.ok, result.traceback
+    assert result.result == {"ok": True}
+    assert "mindspore runtime banner before init" in result.stdout
+    assert "torch4ms runtime banner before result" in result.stdout
+    assert "Invalid worker response" not in (result.traceback or "")
+
+
+def test_original_torchbridgebench_torch4ms_report_is_anti_regression_fixture() -> None:
+    report = Path("/home/ma-user/work/torchbridgebench/artifacts/reports/report_torch4ms_ms272_cann85_npu_20260510_clean.json")
+    if not report.exists():
+        pytest.skip("original torchbridgebench anti-regression report is not present in this workspace")
+
+    data = json.loads(report.read_text(encoding="utf-8"))
+    results = data.get("results") or []
+    assert data.get("backend") == "torch4ms"
+    assert len(results) == 41
+    assert all(item.get("compatibility") is True for item in results)
+    assert all(item.get("correctness") is True for item in results)
+    assert {item.get("layer") for item in results} >= {"operator", "module", "autograd", "model", "end2end"}
+    assert "repo_training_regression" in {item.get("suite_name") for item in results}
+
+
+def test_gpu_reference_status_reports_mapping_required_for_mismatched_case_ids(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    gpu_root = tmp_path / "gpu"
+    gpu_root.mkdir()
+    (gpu_root / "summary.json").write_text(
+        json.dumps(
+            {
+                "passed_cases": [
+                    {"test_case_id": "bench_v1.0.0/L1/conv2d/001"},
+                    {"test_case_id": "bench_v1.0.0/L1/relu/001"},
+                ],
+                "failed_cases": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    case = tmp_path / "case.json"
+    suite = tmp_path / "suite.json"
+    case.write_text(
+        json.dumps({"id": "bench_v1.0.0/L1/conv/conv2d_fp32", "level": "L1", "track": "unit", "code": "RESULT = 1"}),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "mismatch", "cases": [str(case)], "adapters": []}), encoding="utf-8")
+
+    class Args:
+        pass
+
+    Args.artifact_root = str(gpu_root)
+    Args.suite = str(suite)
+
+    assert tbbcc.cmd_gpu_reference_status(Args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["gpu_case_count"] == 2
+    assert payload["suite_case_count"] == 1
+    assert payload["direct_overlap_count"] == 0
+    assert payload["mapping_required"] is True
+
+
+def test_gpu_reference_collector_uses_canonical_case_id(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    case = tmp_path / "case.json"
+    suite = tmp_path / "suite.json"
+    out = tmp_path / "gpu_reference"
+    case.write_text(
+        json.dumps(
+            {
+                "id": "bench_v1.0.0/L1/unit/reference_case",
+                "level": "L1",
+                "track": "unit",
+                "seed": 42,
+                "code": "RESULT = {'value': 1.0}",
+                "expected_ops": ["unit.op"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "unit_gpu_reference", "cases": [str(case)], "adapters": []}), encoding="utf-8")
+
+    class Args:
+        pass
+
+    Args.suite = str(suite)
+    Args.out = str(out)
+    Args.device = "cpu"
+    Args.timeout = 10
+    Args.no_resume = False
+    Args.allow_cpu_fallback = False
+
+    assert tbbcc_gpu_reference.collect_gpu_reference(Args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["totals"]["passed"] == 1
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == "tbbcc.gpu_reference.manifest.v1"
+    assert manifest["canonical_case_system"] == "benchmarks/v1.0.0 case.id"
+    assert manifest["cases"][0]["case_id"] == "bench_v1.0.0/L1/unit/reference_case"
+    reference = json.loads((out / "cases" / "bench_v1.0.0_L1_unit_reference_case" / "reference.json").read_text(encoding="utf-8"))
+    assert reference["schema_version"] == "tbbcc.gpu_reference.case.v1"
+    assert reference["case_id"] == "bench_v1.0.0/L1/unit/reference_case"
+    assert reference["channels"]["result"] == {"value": 1.0}
+
+    class StatusArgs:
+        pass
+
+    StatusArgs.artifact_root = str(out)
+    StatusArgs.suite = str(suite)
+    assert tbbcc.cmd_gpu_reference_status(StatusArgs()) == 0
+    status_payload = json.loads(capsys.readouterr().out)
+    assert status_payload["gpu_case_count"] == 1
+    assert status_payload["suite_case_count"] == 1
+    assert status_payload["direct_overlap_count"] == 1
+    assert status_payload["mapping_required"] is False
 
 
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ the harness only requires the case to expose a JSON-normalizable RESULT or run()
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import datetime as _dt
 import importlib.util
@@ -17,12 +18,14 @@ import math
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
 import textwrap
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,11 @@ FAILURE_CLASSES = {
     "EnvironmentFailure",
     "DependencyMissing",
     "ImportOrderError",
+    "InputMismatch",
+    "RNGMismatch",
+    "AdapterIncomplete",
+    "HarnessFailure",
+    "ProtocolContamination",
     "OperatorNotFound",
     "TypeMismatch",
     "ShapeMismatch",
@@ -95,6 +103,11 @@ class ExecResult:
     stdout: str
     stderr: str
     traceback: str | None
+
+
+_TENSOR_SUMMARY_KEY = "__tbbcc_tensor_summary__"
+_MAX_TEXT_FIELD_CHARS = 8000
+_MAX_RESUMABLE_REPORT_BYTES = 10_000_000
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -242,12 +255,19 @@ def _optional_float(value: Any) -> float | None:
 
 
 def _runner_source(preamble: str, code: str) -> str:
-    preamble_block = textwrap.indent(preamble, "    ") if preamble.strip() else "    pass"
-    code_block = textwrap.indent(code, "    ")
+    return _runner_program(preamble, code, worker=False)
+
+
+def _runner_prelude() -> str:
     return f'''import json
+import hashlib
 import math
+import os
 import sys
 import traceback
+import uuid
+
+TBBCC_ARTIFACT_DIR = os.environ.get("TBBCC_ARTIFACT_DIR")
 
 def _normalize(value):
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -265,6 +285,8 @@ def _normalize(value):
         value = value.detach()
     if hasattr(value, "cpu"):
         value = value.cpu()
+    if hasattr(value, "shape") and hasattr(value, "tolist"):
+        return _tensor_summary(value)
     if hasattr(value, "tolist"):
         return _normalize(value.tolist())
     if hasattr(value, "item"):
@@ -273,6 +295,91 @@ def _normalize(value):
         except Exception:
             pass
     return repr(value)
+
+def _tensor_summary(value):
+    shape = [int(x) for x in getattr(value, "shape", [])]
+    dtype = str(getattr(value, "dtype", type(value).__name__))
+    summary = {{
+        "{_TENSOR_SUMMARY_KEY}": True,
+        "shape": shape,
+        "dtype": dtype,
+        "numel": _numel(shape),
+        "sample": [],
+    }}
+    try:
+        import numpy as _np
+        arr = value.detach().cpu().numpy() if hasattr(value, "detach") else _np.asarray(value)
+        flat = arr.reshape(-1)
+        sample = flat[:8]
+        summary["sample"] = [_scalar(x) for x in sample]
+        summary["sha256"] = hashlib.sha256(_np.ascontiguousarray(arr).view(_np.uint8)).hexdigest()
+        if flat.size:
+            numeric = _np.abs(arr).astype("float64", copy=False) if _np.issubdtype(arr.dtype, _np.number) else None
+            if numeric is not None:
+                finite = numeric[_np.isfinite(numeric)]
+                summary["finite_count"] = int(finite.size)
+                summary["nan_count"] = int(_np.isnan(numeric).sum())
+                summary["inf_count"] = int(_np.isinf(numeric).sum())
+                if finite.size:
+                    summary["min"] = float(finite.min())
+                    summary["max"] = float(finite.max())
+                    summary["mean"] = float(finite.mean())
+                    summary["std"] = float(finite.std())
+        if TBBCC_ARTIFACT_DIR:
+            os.makedirs(TBBCC_ARTIFACT_DIR, exist_ok=True)
+            artifact = os.path.join(TBBCC_ARTIFACT_DIR, f"tensor_{{uuid.uuid4().hex}}.npy")
+            _np.save(artifact, arr, allow_pickle=False)
+            summary["artifact_path"] = artifact
+            summary["artifact_format"] = "npy"
+    except Exception as exc:
+        try:
+            raw = value.tolist()
+            summary["sample"] = _sample_nested(raw)
+        except Exception:
+            pass
+        summary["artifact_error"] = repr(exc)
+    return summary
+
+def _numel(shape):
+    total = 1
+    for item in shape:
+        total *= int(item)
+    return int(total)
+
+def _scalar(value):
+    try:
+        if hasattr(value, "item"):
+            value = value.item()
+    except Exception:
+        pass
+    if isinstance(value, float):
+        if math.isnan(value):
+            return {{"__float__": "nan"}}
+        if math.isinf(value):
+            return {{"__float__": "inf" if value > 0 else "-inf"}}
+    if isinstance(value, complex):
+        return {{"real": _scalar(value.real), "imag": _scalar(value.imag)}}
+    return value
+
+def _sample_nested(value, limit=8):
+    out = []
+    stack = [value]
+    while stack and len(out) < limit:
+        item = stack.pop(0)
+        if isinstance(item, (list, tuple)):
+            stack = list(item) + stack
+        else:
+            out.append(_normalize(item))
+    return out
+'''
+
+
+def _runner_program(preamble: str, code: str, worker: bool) -> str:
+    preamble_block = textwrap.indent(preamble, "    ") if preamble.strip() else "    pass"
+    code_block = textwrap.indent(code, "    ")
+    prelude = _runner_prelude()
+    if not worker:
+        return f'''{prelude}
 
 try:
 {preamble_block}
@@ -299,9 +406,51 @@ except Exception:
     print("TBBCC_TRACEBACK_END", file=sys.stderr)
     sys.exit(1)
 '''
+    return f'''{prelude}
+
+def _run_case(code, artifact_dir):
+    global TBBCC_ARTIFACT_DIR
+    TBBCC_ARTIFACT_DIR = artifact_dir
+    namespace = dict(globals())
+    try:
+        exec(code, namespace, namespace)
+        if "RESULT" in namespace:
+            result = namespace["RESULT"]
+        elif "run" in namespace and callable(namespace["run"]):
+            result = namespace["run"]()
+        else:
+            raise RuntimeError("Test code must define RESULT or run().")
+        payload = {{"result": _normalize(result)}}
+        if "ACTIVATIONS" in namespace:
+            payload["activations"] = _normalize(namespace["ACTIVATIONS"])
+        if "GRADIENTS" in namespace:
+            payload["gradients"] = _normalize(namespace["GRADIENTS"])
+        if "TASK_METRICS" in namespace:
+            payload["task_metrics"] = _normalize(namespace["TASK_METRICS"])
+        return {{"ok": True, "payload": payload}}
+    except Exception:
+        return {{"ok": False, "traceback": traceback.format_exc()}}
+
+try:
+{preamble_block}
+except Exception:
+    print("TBBCC_WORKER_INIT_JSON=" + json.dumps({{"ok": False, "traceback": traceback.format_exc()}}, sort_keys=True), flush=True)
+    sys.exit(1)
+
+print("TBBCC_WORKER_INIT_JSON=" + json.dumps({{"ok": True}}, sort_keys=True), flush=True)
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+        started = request.get("started_at")
+        result = _run_case(str(request.get("code") or ""), request.get("artifact_dir"))
+        result["request_id"] = request.get("request_id")
+        print("TBBCC_WORKER_RESULT_JSON=" + json.dumps(result, sort_keys=True), flush=True)
+    except Exception:
+        print("TBBCC_WORKER_RESULT_JSON=" + json.dumps({{"ok": False, "traceback": traceback.format_exc()}}, sort_keys=True), flush=True)
+'''
 
 
-def execute_python(role: str, preamble: str, code: str, env: dict[str, str], timeout: int) -> ExecResult:
+def execute_python(role: str, preamble: str, code: str, env: dict[str, str], timeout: int, artifact_dir: Path | None = None) -> ExecResult:
     source = _runner_source(preamble, code)
     start = _dt.datetime.now(_dt.UTC)
     with tempfile.TemporaryDirectory(prefix="tbbcc_") as td:
@@ -309,6 +458,10 @@ def execute_python(role: str, preamble: str, code: str, env: dict[str, str], tim
         script.write_text(source, encoding="utf-8")
         merged_env = os.environ.copy()
         merged_env.update(env)
+        if artifact_dir is not None:
+            role_artifact_dir = artifact_dir / role
+            role_artifact_dir.mkdir(parents=True, exist_ok=True)
+            merged_env["TBBCC_ARTIFACT_DIR"] = str(role_artifact_dir)
         try:
             proc = subprocess.run(
                 [sys.executable, str(script)],
@@ -350,7 +503,7 @@ def execute_python(role: str, preamble: str, code: str, env: dict[str, str], tim
     )
 
 
-def execute_python_pair(source_preamble: str, target_preamble: str, code: str, env: dict[str, str], timeout: int) -> tuple[ExecResult, ExecResult]:
+def execute_python_pair(source_preamble: str, target_preamble: str, code: str, env: dict[str, str], timeout: int, artifact_dir: Path | None = None) -> tuple[ExecResult, ExecResult]:
     """Execute source and target in separate Python subprocesses.
 
     Bridge adapters can be import-order sensitive. Keeping both roles in one
@@ -359,9 +512,180 @@ def execute_python_pair(source_preamble: str, target_preamble: str, code: str, e
     benchmark measures bridge compatibility, not contamination by the harness,
     so isolation is the default.
     """
-    source = execute_python("source", source_preamble, code, {}, timeout)
-    target = execute_python("target", target_preamble, code, env, timeout)
+    source = execute_python("source", source_preamble, code, {}, timeout, artifact_dir=artifact_dir)
+    target = execute_python("target", target_preamble, code, env, timeout, artifact_dir=artifact_dir)
     return source, target
+
+
+class PersistentPythonWorker:
+    def __init__(self, role: str, preamble: str, env: dict[str, str], timeout: int, artifact_root: Path):
+        self.role = role
+        self.timeout = timeout
+        self.artifact_root = artifact_root
+        self._tmp = tempfile.TemporaryDirectory(prefix="tbbcc_worker_")
+        self._script = Path(self._tmp.name) / f"{role}_worker.py"
+        self._script.write_text(_runner_program(preamble, "", worker=True), encoding="utf-8")
+        merged_env = os.environ.copy()
+        merged_env.update(env)
+        self.proc = subprocess.Popen(
+            [sys.executable, str(self._script)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=merged_env,
+        )
+        init_line, init_noise = self._read_protocol_line("TBBCC_WORKER_INIT_JSON=", timeout)
+        if not init_line.startswith("TBBCC_WORKER_INIT_JSON="):
+            stderr = self._read_stderr_nonblocking()
+            self.close()
+            raise RuntimeError(f"{role} worker failed to initialize: {init_line.strip()} {stderr}".strip())
+        self.stdout_noise: list[str] = init_noise
+        payload = json.loads(init_line.split("=", 1)[1])
+        if not payload.get("ok"):
+            tb = payload.get("traceback") or self._read_stderr_nonblocking()
+            self.close()
+            raise RuntimeError(f"{role} worker init error: {tb}")
+
+    def _read_stdout_line(self, timeout: int) -> str:
+        import queue
+        import threading
+
+        q: queue.Queue[str] = queue.Queue(maxsize=1)
+
+        def _reader() -> None:
+            assert self.proc.stdout is not None
+            q.put(self.proc.stdout.readline())
+
+        thread = threading.Thread(target=_reader, daemon=True)
+        thread.start()
+        try:
+            line = q.get(timeout=timeout)
+        except queue.Empty as exc:
+            self.close()
+            raise TimeoutError(f"{self.role} worker timeout after {timeout}s") from exc
+        if line == "":
+            stderr = self._read_stderr_nonblocking()
+            raise RuntimeError(f"{self.role} worker exited unexpectedly: {stderr}")
+        return line
+
+    def _read_protocol_line(self, prefix: str, timeout: int) -> tuple[str, list[str]]:
+        noise: list[str] = []
+        while True:
+            line = self._read_stdout_line(timeout)
+            if line.startswith(prefix):
+                return line, noise
+            noise.append(line)
+
+    def _read_stderr_nonblocking(self) -> str:
+        if self.proc.stderr is None:
+            return ""
+        try:
+            import select
+
+            chunks = []
+            while select.select([self.proc.stderr], [], [], 0)[0]:
+                chunk = self.proc.stderr.readline()
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return "".join(chunks)
+        except Exception:
+            return ""
+
+    def run_case(self, code: str, case_artifact_dir: Path) -> ExecResult:
+        start = _dt.datetime.now(_dt.UTC)
+        request_id = uuid.uuid4().hex
+        role_artifact_dir = case_artifact_dir / self.role
+        role_artifact_dir.mkdir(parents=True, exist_ok=True)
+        if self.proc.stdin is None:
+            raise RuntimeError(f"{self.role} worker stdin unavailable")
+        request = {
+            "request_id": request_id,
+            "code": code,
+            "artifact_dir": str(role_artifact_dir),
+        }
+        try:
+            self.proc.stdin.write(json.dumps(request) + "\n")
+            self.proc.stdin.flush()
+            line, noise = self._read_protocol_line("TBBCC_WORKER_RESULT_JSON=", self.timeout)
+            self.stdout_noise.extend(noise)
+        except Exception as exc:
+            end = _dt.datetime.now(_dt.UTC)
+            return ExecResult(
+                role=self.role,
+                ok=False,
+                result=None,
+                activations=None,
+                gradients=None,
+                task_metrics=None,
+                returncode=self.proc.poll() if self.proc.poll() is not None else 1,
+                duration_seconds=(end - start).total_seconds(),
+                stdout="",
+                stderr=self._read_stderr_nonblocking() or repr(exc),
+                traceback=repr(exc),
+            )
+        end = _dt.datetime.now(_dt.UTC)
+        payload = json.loads(line.split("=", 1)[1])
+        if payload.get("request_id") not in (None, request_id):
+            return ExecResult(
+                role=self.role,
+                ok=False,
+                result=None,
+                activations=None,
+                gradients=None,
+                task_metrics=None,
+                returncode=1,
+                duration_seconds=(end - start).total_seconds(),
+                stdout=line,
+                stderr="",
+                traceback=f"Worker response request_id mismatch: {payload.get('request_id')} != {request_id}",
+            )
+        result_payload = payload.get("payload") if payload.get("ok") else None
+        tb = payload.get("traceback")
+        return ExecResult(
+            role=self.role,
+            ok=bool(payload.get("ok")) and isinstance(result_payload, dict),
+            result=None if not isinstance(result_payload, dict) else result_payload.get("result"),
+            activations=None if not isinstance(result_payload, dict) else result_payload.get("activations"),
+            gradients=None if not isinstance(result_payload, dict) else result_payload.get("gradients"),
+            task_metrics=None if not isinstance(result_payload, dict) else result_payload.get("task_metrics"),
+            returncode=0 if payload.get("ok") else 1,
+            duration_seconds=(end - start).total_seconds(),
+            stdout=_trim_text("[persistent-worker] payload returned over control channel\n" + "".join(self.stdout_noise[-20:])),
+            stderr=self._read_stderr_nonblocking(),
+            traceback=tb,
+        )
+
+    def close(self) -> None:
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self._tmp.cleanup()
+
+
+class PersistentWorkerPair:
+    def __init__(self, adapter: AdapterSpec, timeout: int, artifact_root: Path):
+        self.source = PersistentPythonWorker("source", adapter.source_preamble, {}, timeout, artifact_root)
+        self.target = PersistentPythonWorker("target", adapter.preamble, adapter.env, timeout, artifact_root)
+
+    def run_pair(self, code: str, artifact_dir: Path) -> tuple[ExecResult, ExecResult]:
+        return self.source.run_case(code, artifact_dir), self.target.run_case(code, artifact_dir)
+
+    def close(self) -> None:
+        self.source.close()
+        self.target.close()
 
 
 class _Missing:
@@ -404,6 +728,16 @@ def _flatten_numbers(value: Any, prefix: str = "$") -> tuple[list[float], list[s
     numbers: list[float] = []
     paths: list[str] = []
     if isinstance(value, dict):
+        if value.get(_TENSOR_SUMMARY_KEY) is True:
+            for key in ("min", "max", "mean", "std"):
+                if isinstance(value.get(key), (int, float)) and not isinstance(value.get(key), bool):
+                    numbers.append(float(value[key]))
+                    paths.append(f"{prefix}.{key}")
+            for idx, item in enumerate(value.get("sample") or []):
+                child_numbers, child_paths = _flatten_numbers(item, f"{prefix}.sample[{idx}]")
+                numbers.extend(child_numbers)
+                paths.extend(child_paths)
+            return numbers, paths
         if set(value.keys()) == {"__float__"}:
             marker = value["__float__"]
             if marker == "nan":
@@ -429,7 +763,233 @@ def _flatten_numbers(value: Any, prefix: str = "$") -> tuple[list[float], list[s
     return numbers, paths
 
 
+def _is_tensor_summary(value: Any) -> bool:
+    return isinstance(value, dict) and value.get(_TENSOR_SUMMARY_KEY) is True
+
+
+def _load_tensor_artifact(summary: dict[str, Any]) -> Any | None:
+    path = summary.get("artifact_path")
+    if not path:
+        return None
+    try:
+        import numpy as np  # type: ignore
+
+        return np.load(path, allow_pickle=False)
+    except Exception:
+        return None
+
+
+def _compare_tensor_summaries(src: dict[str, Any], tgt: dict[str, Any], atol: float, rtol: float) -> dict[str, Any]:
+    if src.get("shape") != tgt.get("shape"):
+        return {
+            "passed": False,
+            "reason": "ShapeMismatch",
+            "source_shape": src.get("shape"),
+            "target_shape": tgt.get("shape"),
+        }
+    src_arr = _load_tensor_artifact(src)
+    tgt_arr = _load_tensor_artifact(tgt)
+    if src_arr is None or tgt_arr is None:
+        metrics = compare_values(src.get("sample"), tgt.get("sample"), atol, rtol)
+        metrics.update(
+            {
+                "comparison_mode": "tensor_summary_sample",
+                "source_shape": src.get("shape"),
+                "target_shape": tgt.get("shape"),
+                "count": src.get("numel"),
+            }
+        )
+        return metrics
+
+    try:
+        import numpy as np  # type: ignore
+
+        if tuple(src_arr.shape) != tuple(tgt_arr.shape):
+            return {
+                "passed": False,
+                "reason": "ShapeMismatch",
+                "source_shape": list(src_arr.shape),
+                "target_shape": list(tgt_arr.shape),
+            }
+        src_flat = src_arr.reshape(-1)
+        tgt_flat = tgt_arr.reshape(-1)
+        if src_flat.size != tgt_flat.size:
+            return {
+                "passed": False,
+                "reason": "ShapeMismatch",
+                "source_count": int(src_flat.size),
+                "target_count": int(tgt_flat.size),
+            }
+        if src_flat.size == 0:
+            return {
+                "passed": True,
+                "reason": None,
+                "comparison_mode": "tensor_artifact",
+                "count": 0,
+                "atol": atol,
+                "rtol": rtol,
+            }
+        src_num = src_flat.astype("complex128", copy=False) if np.iscomplexobj(src_flat) else src_flat.astype("float64", copy=False)
+        tgt_num = tgt_flat.astype("complex128", copy=False) if np.iscomplexobj(tgt_flat) else tgt_flat.astype("float64", copy=False)
+        diffs = np.abs(src_num - tgt_num)
+        tolerance = atol + rtol * np.abs(tgt_num)
+        finite = np.isfinite(diffs)
+        close = np.isclose(src_num, tgt_num, atol=atol, rtol=rtol, equal_nan=True)
+        failed_count = int((~close).sum())
+        finite_diffs = diffs[finite]
+        dot = float(np.abs(np.vdot(src_num, tgt_num)))
+        src_norm = float(np.linalg.norm(src_num))
+        tgt_norm = float(np.linalg.norm(tgt_num))
+        cosine = dot / (src_norm * tgt_norm) if src_norm > 0 and tgt_norm > 0 else None
+        return {
+            "passed": failed_count == 0,
+            "reason": None if failed_count == 0 else "NumericMismatch",
+            "comparison_mode": "tensor_artifact",
+            "count": int(src_flat.size),
+            "mae": float(finite_diffs.mean()) if finite_diffs.size else float("inf"),
+            "max_error": float(np.nanmax(diffs)) if diffs.size else 0.0,
+            "p95": float(np.percentile(finite_diffs, 95)) if finite_diffs.size else float("inf"),
+            "cosine": cosine,
+            "failed_count": failed_count,
+            "failed_paths": [],
+            "atol": atol,
+            "rtol": rtol,
+            "source_shape": list(src_arr.shape),
+            "target_shape": list(tgt_arr.shape),
+            "source_dtype": str(src_arr.dtype),
+            "target_dtype": str(tgt_arr.dtype),
+            "max_tolerance": float(np.nanmax(tolerance)) if tolerance.size else atol,
+        }
+    except Exception as exc:
+        metrics = compare_values(src.get("sample"), tgt.get("sample"), atol, rtol)
+        metrics.update({"comparison_mode": "tensor_summary_sample", "artifact_error": repr(exc)})
+        return metrics
+
+
+def _contains_tensor_summary(value: Any) -> bool:
+    if _is_tensor_summary(value):
+        return True
+    if isinstance(value, dict):
+        return any(_contains_tensor_summary(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_tensor_summary(v) for v in value)
+    return False
+
+
+def _merge_comparison_metrics(metrics: list[dict[str, Any]], atol: float, rtol: float) -> dict[str, Any]:
+    if not metrics:
+        return {"passed": True, "reason": None, "count": 0, "atol": atol, "rtol": rtol}
+    passed = all(bool(item.get("passed")) for item in metrics)
+    count = sum(int(item.get("count") or 0) for item in metrics)
+    failed_count = sum(int(item.get("failed_count") or 0) for item in metrics)
+    finite_mae_weighted = 0.0
+    finite_mae_count = 0
+    max_error = 0.0
+    p95_values = []
+    cosine_values = []
+    failed_paths: list[str] = []
+    reasons = []
+    for item in metrics:
+        if item.get("reason"):
+            reasons.append(str(item["reason"]))
+        item_count = int(item.get("count") or 0)
+        mae = item.get("mae")
+        if isinstance(mae, (int, float)) and math.isfinite(float(mae)) and item_count:
+            finite_mae_weighted += float(mae) * item_count
+            finite_mae_count += item_count
+        err = item.get("max_error")
+        if isinstance(err, (int, float)):
+            max_error = max(max_error, float(err))
+        p95 = item.get("p95")
+        if isinstance(p95, (int, float)) and math.isfinite(float(p95)):
+            p95_values.append(float(p95))
+        cosine = item.get("cosine")
+        if isinstance(cosine, (int, float)) and math.isfinite(float(cosine)):
+            cosine_values.append(float(cosine))
+        failed_paths.extend(str(path) for path in item.get("failed_paths", [])[:20])
+    return {
+        "passed": passed,
+        "reason": None if passed else (reasons[0] if reasons else "NumericMismatch"),
+        "comparison_mode": "recursive_tensor_artifact",
+        "count": count,
+        "mae": (finite_mae_weighted / finite_mae_count) if finite_mae_count else (0.0 if passed else float("inf")),
+        "max_error": max_error,
+        "p95": max(p95_values) if p95_values else (0.0 if passed else float("inf")),
+        "cosine": statistics.fmean(cosine_values) if cosine_values else None,
+        "failed_count": failed_count,
+        "failed_paths": failed_paths[:20],
+        "atol": atol,
+        "rtol": rtol,
+    }
+
+
+def _compare_recursive_values(src: Any, tgt: Any, atol: float, rtol: float, prefix: str = "$") -> dict[str, Any]:
+    if _is_tensor_summary(src) or _is_tensor_summary(tgt):
+        if not (_is_tensor_summary(src) and _is_tensor_summary(tgt)):
+            return {
+                "passed": False,
+                "reason": "ShapeMismatch",
+                "source_shape": _shape_signature(src),
+                "target_shape": _shape_signature(tgt),
+                "failed_paths": [prefix],
+                "failed_count": 1,
+                "atol": atol,
+                "rtol": rtol,
+            }
+        metrics = _compare_tensor_summaries(src, tgt, atol, rtol)
+        if not metrics.get("passed"):
+            metrics["failed_paths"] = [prefix] + [f"{prefix}{path[1:]}" for path in metrics.get("failed_paths", [])[:19] if isinstance(path, str)]
+        return metrics
+    if isinstance(src, dict) and isinstance(tgt, dict):
+        if set(src.keys()) != set(tgt.keys()):
+            return {
+                "passed": False,
+                "reason": "ShapeMismatch",
+                "source_keys": sorted(src.keys()),
+                "target_keys": sorted(tgt.keys()),
+                "failed_paths": [prefix],
+                "failed_count": 1,
+                "atol": atol,
+                "rtol": rtol,
+            }
+        return _merge_comparison_metrics(
+            [_compare_recursive_values(src[key], tgt[key], atol, rtol, f"{prefix}.{key}") for key in sorted(src)],
+            atol,
+            rtol,
+        )
+    if isinstance(src, list) and isinstance(tgt, list):
+        if len(src) != len(tgt):
+            return {
+                "passed": False,
+                "reason": "ShapeMismatch",
+                "source_count": len(src),
+                "target_count": len(tgt),
+                "failed_paths": [prefix],
+                "failed_count": 1,
+                "atol": atol,
+                "rtol": rtol,
+            }
+        return _merge_comparison_metrics(
+            [_compare_recursive_values(a, b, atol, rtol, f"{prefix}[{idx}]") for idx, (a, b) in enumerate(zip(src, tgt))],
+            atol,
+            rtol,
+        )
+    return compare_values(src, tgt, atol, rtol)
+
+
 def compare_values(src: Any, tgt: Any, atol: float, rtol: float) -> dict[str, Any]:
+    if _is_tensor_summary(src) or _is_tensor_summary(tgt):
+        if not (_is_tensor_summary(src) and _is_tensor_summary(tgt)):
+            return {
+                "passed": False,
+                "reason": "ShapeMismatch",
+                "source_shape": _shape_signature(src),
+                "target_shape": _shape_signature(tgt),
+            }
+        return _compare_tensor_summaries(src, tgt, atol, rtol)
+    if _contains_tensor_summary(src) or _contains_tensor_summary(tgt):
+        return _compare_recursive_values(src, tgt, atol, rtol)
+
     if _shape_signature(src) != _shape_signature(tgt):
         return {
             "passed": False,
@@ -497,6 +1057,8 @@ def compare_values(src: Any, tgt: Any, atol: float, rtol: float) -> dict[str, An
 
 def _shape_signature(value: Any) -> Any:
     if isinstance(value, dict):
+        if value.get(_TENSOR_SUMMARY_KEY) is True:
+            return ["tensor", value.get("shape")]
         if set(value.keys()) == {"__float__"}:
             return "number"
         return {k: _shape_signature(value[k]) for k in sorted(value)}
@@ -646,7 +1208,17 @@ def auto_classify(
     return {
         "class": cls,
         "evidence": evidence,
-        "counts_toward_compatibility": cls not in {"EnvironmentFailure", "DependencyMissing", "ImportOrderError"},
+        "counts_toward_compatibility": cls
+        not in {
+            "EnvironmentFailure",
+            "DependencyMissing",
+            "ImportOrderError",
+            "InputMismatch",
+            "RNGMismatch",
+            "AdapterIncomplete",
+            "HarnessFailure",
+            "ProtocolContamination",
+        },
     }
 
 
@@ -703,6 +1275,13 @@ def build_report(case: TestCase, adapter: AdapterSpec, source: ExecResult, targe
     return {
         "schema_version": "tbbcc.report.v0.1",
         "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+        "comparison_scope": {
+            "mode": "local-pair",
+            "source": "local source_preamble execution",
+            "target": "local adapter preamble execution",
+            "paper_numeric_baseline": False,
+            "note": "Formal GPU-vs-NPU numeric conclusions require gpu-reference mode with GPU PyTorch artifacts.",
+        },
         "final_state": final_state,
         "case": dataclasses.asdict(case),
         "adapter": dataclasses.asdict(adapter),
@@ -733,6 +1312,47 @@ def build_report(case: TestCase, adapter: AdapterSpec, source: ExecResult, targe
             **effort,
         },
     }
+
+
+def _trim_text(value: str, limit: int = _MAX_TEXT_FIELD_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    head = value[: limit // 2]
+    tail = value[-limit // 2 :]
+    return f"{head}\n...[truncated {len(value) - limit} chars]...\n{tail}"
+
+
+def _strip_runtime_artifacts(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _strip_runtime_artifacts(v) for k, v in value.items() if k not in {"artifact_path"}}
+    if isinstance(value, list):
+        return [_strip_runtime_artifacts(item) for item in value]
+    if isinstance(value, str):
+        return _trim_text(value)
+    return value
+
+
+def compact_report_for_storage(report: dict[str, Any]) -> dict[str, Any]:
+    compact = copy.deepcopy(report)
+    for tier in (compact.get("tiers") or {}).values():
+        if not isinstance(tier, dict):
+            continue
+        for role in ("source", "target"):
+            result = tier.get(role)
+            if not isinstance(result, dict):
+                continue
+            result["result"] = _strip_runtime_artifacts(result.get("result"))
+            result["activations"] = _strip_runtime_artifacts(result.get("activations"))
+            result["gradients"] = _strip_runtime_artifacts(result.get("gradients"))
+            result["task_metrics"] = _strip_runtime_artifacts(result.get("task_metrics"))
+            for text_field in ("stdout", "stderr", "traceback"):
+                if isinstance(result.get(text_field), str):
+                    text_value = result[text_field]
+                    if "TBBCC_PAYLOAD_JSON=" in text_value:
+                        result[text_field] = "[compact-report] payload stdout omitted; see result/activations/gradients/task_metrics summaries."
+                    else:
+                        result[text_field] = _trim_text(text_value)
+    return compact
 
 
 def inspect_environment(import_versions: bool = False) -> dict[str, Any]:
@@ -824,8 +1444,9 @@ def write_report(report: dict[str, Any], out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "report.json"
     md_path = out_dir / "report.md"
-    json_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    md_path.write_text(render_markdown(report), encoding="utf-8")
+    compact = compact_report_for_storage(report)
+    json_path.write_text(json.dumps(compact, indent=2, ensure_ascii=False), encoding="utf-8")
+    md_path.write_text(render_markdown(compact), encoding="utf-8")
     return json_path, md_path
 
 
@@ -911,6 +1532,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- Case: `{report['case']['id']}`",
         f"- Adapter: `{report['adapter']['bridge_id']}`",
+        f"- Comparison scope: `{(report.get('comparison_scope') or {}).get('mode', 'unknown')}`",
         f"- Final state: `{report['final_state']}`",
         f"- Tier-1 passed: `{t1['passed']}`",
         f"- Failure class: `{cls['class']}`",
@@ -980,6 +1602,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             "",
             "## Scope Notes",
             "",
+            "- `local-pair` numeric metrics compare local source execution against local adapter execution. They are diagnostic, not the formal GPU-vs-NPU paper baseline.",
             "- Tier-2 is implemented when a case exposes ACTIVATIONS or GRADIENTS.",
             "- Tier-3 is implemented when a case exposes TASK_METRICS.",
             "- Agent effort is read from an optional effort ledger; deterministic runs without a ledger record zero agent effort.",
@@ -1023,6 +1646,7 @@ def render_suite_markdown(summary: dict[str, Any]) -> str:
         f"| Compatibility rate | `{compatibility_text}` | Bridge-relevant pass rate after excluding environment noise. |",
         f"| First-pass rate | `{quality.get('first_pass_rate')}` | Passed without counted repair effort. |",
         f"| Raw pass rate | `{raw_pass_text}` | All runs passed divided by all runs. |",
+        f"| Executed / skipped | `{totals.get('executed')}` / `{totals.get('skipped')}` | Freshly executed runs versus valid reports reused by resume. |",
         f"| ME | `{effort_summary.get('me')}` | Total counted migration effort: adapt + repair. |",
         f"| AR | `{effort_summary.get('ar')}` | Work avoided versus calibrated no-bridge baseline. |",
         f"| Scope-adjusted AR | `{effort_summary.get('scope_adjusted_ar')}` | Subset-only diagnostic when not running the full baseline task set. |",
@@ -1156,7 +1780,22 @@ def run_eval(case_path: Path, adapter_path: Path, out_dir: Path, timeout_overrid
     timeout = int(timeout_override or adapter.timeout_seconds)
     atol = float(atol_override if atol_override is not None else case.ground_truth.get("atol", adapter.atol))
     rtol = float(rtol_override if rtol_override is not None else case.ground_truth.get("rtol", adapter.rtol))
-    source, target = execute_python_pair(adapter.source_preamble, adapter.preamble, case.code, adapter.env, timeout)
+    artifact_dir = out_dir / "artifacts"
+    source, target = execute_python_pair(adapter.source_preamble, adapter.preamble, case.code, adapter.env, timeout, artifact_dir=artifact_dir)
+    return build_and_write_eval_report(case, adapter, source, target, out_dir, artifact_dir, started, atol, rtol)
+
+
+def build_and_write_eval_report(
+    case: TestCase,
+    adapter: AdapterSpec,
+    source: ExecResult,
+    target: ExecResult,
+    out_dir: Path,
+    artifact_dir: Path,
+    started: _dt.datetime,
+    atol: float,
+    rtol: float,
+) -> dict[str, Any]:
     comparison: dict[str, Any]
     if source.ok and target.ok:
         comparison = compare_values(source.result, target.result, atol, rtol)
@@ -1165,6 +1804,7 @@ def run_eval(case_path: Path, adapter_path: Path, out_dir: Path, timeout_overrid
     report = build_report(case, adapter, source, target, comparison)
     report["timing"]["wall_clock_seconds"] = (_dt.datetime.now(_dt.UTC) - started).total_seconds()
     json_path, md_path = write_report(report, out_dir)
+    shutil.rmtree(artifact_dir, ignore_errors=True)
     report["_paths"] = {"report_json": str(json_path), "report_md": str(md_path)}
     return report
 
@@ -1204,76 +1844,156 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
     failure_classes: dict[str, int] = {}
     passed = 0
     failed = 0
+    executed = 0
+    skipped = 0
     compatibility_total = 0
     compatibility_passed = 0
     migration_samples: list[dict[str, Any]] = []
-    for case_item in cases:
-        case_path = _resolve_path(base, str(case_item))
-        case_obj = load_case(case_path)
-        for adapter_item in adapters:
-            adapter_path = _resolve_path(base, str(adapter_item))
-            adapter_obj = load_adapter(adapter_path)
-            run_dir = out_dir / "runs" / f"{_slug(case_obj.id)}__{_slug(adapter_obj.bridge_id)}"
-            report = run_eval(
-                case_path,
-                adapter_path,
-                run_dir,
-                timeout_override=args.timeout,
-                atol_override=args.atol,
-                rtol_override=args.rtol,
-            )
-            paths = report.pop("_paths")
-            cls = report["tiers"]["T1"]["auto_classification"]["class"]
-            counts_toward_compatibility = report["tiers"]["T1"]["auto_classification"]["counts_toward_compatibility"]
-            run_duration = report.get("timing", {}).get("wall_clock_seconds")
-            effort = report.get("effort", {})
-            migration_samples.append(
-                {
-                    "case_id": case_obj.id,
-                    "task_id": case_obj.id,
-                    "bridge_id": adapter_obj.bridge_id,
-                    "reroll_index": 1,
-                    "final_state": report["final_state"],
-                    "exec_passed": bool(report.get("tiers", {}).get("T1", {}).get("passed")),
-                    "full_passed": report["final_state"] == "ALL_PASS",
-                    "all_tiers_passed": report["final_state"] == "ALL_PASS",
-                }
-            )
-            if report["final_state"] == "ALL_PASS":
-                passed += 1
-                if counts_toward_compatibility:
-                    compatibility_passed += 1
-            else:
-                failed += 1
-                failure_classes[cls] = failure_classes.get(cls, 0) + 1
+    resume_enabled = not bool(getattr(args, "no_resume", False))
+    isolated_per_case = bool(getattr(args, "isolated_per_case", False))
+    worker_mode = "isolated_per_case" if isolated_per_case else "persistent"
+    worker_pairs: dict[str, PersistentWorkerPair] = {}
+    worker_fallback_errors: list[str] = []
+
+    def _load_existing_report(path: Path) -> dict[str, Any] | None:
+        if not resume_enabled or not path.exists():
+            return None
+        try:
+            if path.stat().st_size > _MAX_RESUMABLE_REPORT_BYTES:
+                return None
+        except OSError:
+            return None
+        try:
+            data = _load_json(path)
+        except SystemExit:
+            return None
+        if not isinstance(data.get("tiers"), dict) or not data.get("final_state"):
+            return None
+        return data
+
+    def _record_report(
+        report: dict[str, Any],
+        case_obj: TestCase,
+        adapter_obj: AdapterSpec,
+        paths: dict[str, str],
+        skipped_existing: bool,
+    ) -> None:
+        nonlocal passed, failed, compatibility_total, compatibility_passed, executed, skipped
+        cls = report["tiers"]["T1"]["auto_classification"]["class"]
+        counts_toward_compatibility = report["tiers"]["T1"]["auto_classification"]["counts_toward_compatibility"]
+        run_duration = report.get("timing", {}).get("wall_clock_seconds")
+        effort = report.get("effort", {})
+        migration_samples.append(
+            {
+                "case_id": case_obj.id,
+                "task_id": case_obj.id,
+                "bridge_id": adapter_obj.bridge_id,
+                "reroll_index": 1,
+                "final_state": report["final_state"],
+                "exec_passed": bool(report.get("tiers", {}).get("T1", {}).get("passed")),
+                "full_passed": report["final_state"] == "ALL_PASS",
+                "all_tiers_passed": report["final_state"] == "ALL_PASS",
+            }
+        )
+        if report["final_state"] == "ALL_PASS":
+            passed += 1
             if counts_toward_compatibility:
-                compatibility_total += 1
-            runs.append(
-                {
-                    "case_id": case_obj.id,
-                    "case_path": str(case_path),
-                    "bridge_id": adapter_obj.bridge_id,
-                    "adapter_path": str(adapter_path),
-                    "final_state": report["final_state"],
-                    "failure_class": cls,
-                    "report_json": paths["report_json"],
-                    "report_md": paths["report_md"],
-                    "counts_toward_compatibility": counts_toward_compatibility,
-                    "duration_seconds": run_duration,
-                    "timing": report.get("timing", {}),
-                    "t1_passed": report.get("tiers", {}).get("T1", {}).get("passed"),
-                    "t1_metrics": report.get("tiers", {}).get("T1", {}).get("metrics", {}),
-                    "t2_implemented": report.get("tiers", {}).get("T2", {}).get("implemented"),
-                    "t2_passed": report.get("tiers", {}).get("T2", {}).get("passed"),
-                    "t3_implemented": report.get("tiers", {}).get("T3", {}).get("implemented"),
-                    "t3_passed": report.get("tiers", {}).get("T3", {}).get("passed"),
-                    "effort_total": effort.get("effort_total"),
-                    "effort_adapt": effort.get("effort_adapt"),
-                    "effort_repair": effort.get("effort_repair"),
-                    "repair_attempts": effort.get("repair_attempts"),
-                    "ar": effort.get("ar"),
-                }
-            )
+                compatibility_passed += 1
+        else:
+            failed += 1
+            failure_classes[cls] = failure_classes.get(cls, 0) + 1
+        if counts_toward_compatibility:
+            compatibility_total += 1
+        if skipped_existing:
+            skipped += 1
+        else:
+            executed += 1
+        runs.append(
+            {
+                "case_id": case_obj.id,
+                "case_path": str(Path(case_obj.source_path).resolve()) if case_obj.source_path else "",
+                "bridge_id": adapter_obj.bridge_id,
+                "adapter_path": str(Path(adapter_obj.source_path).resolve()) if adapter_obj.source_path else "",
+                "final_state": report["final_state"],
+                "failure_class": cls,
+                "report_json": paths["report_json"],
+                "report_md": paths["report_md"],
+                "counts_toward_compatibility": counts_toward_compatibility,
+                "duration_seconds": run_duration,
+                "timing": report.get("timing", {}),
+                "t1_passed": report.get("tiers", {}).get("T1", {}).get("passed"),
+                "t1_metrics": report.get("tiers", {}).get("T1", {}).get("metrics", {}),
+                "t2_implemented": report.get("tiers", {}).get("T2", {}).get("implemented"),
+                "t2_passed": report.get("tiers", {}).get("T2", {}).get("passed"),
+                "t3_implemented": report.get("tiers", {}).get("T3", {}).get("implemented"),
+                "t3_passed": report.get("tiers", {}).get("T3", {}).get("passed"),
+                "effort_total": effort.get("effort_total"),
+                "effort_adapt": effort.get("effort_adapt"),
+                "effort_repair": effort.get("effort_repair"),
+                "repair_attempts": effort.get("repair_attempts"),
+                "ar": effort.get("ar"),
+                "resumed_from_cache": skipped_existing,
+            }
+        )
+
+    try:
+        for case_item in cases:
+            case_path = _resolve_path(base, str(case_item))
+            case_obj = load_case(case_path)
+            for adapter_item in adapters:
+                adapter_path = _resolve_path(base, str(adapter_item))
+                adapter_obj = load_adapter(adapter_path)
+                run_dir = out_dir / "runs" / f"{_slug(case_obj.id)}__{_slug(adapter_obj.bridge_id)}"
+                report_json = run_dir / "report.json"
+                report_md = run_dir / "report.md"
+                existing_report = _load_existing_report(report_json)
+                if existing_report is not None:
+                    _record_report(
+                        existing_report,
+                        case_obj,
+                        adapter_obj,
+                        {"report_json": str(report_json.resolve()), "report_md": str(report_md.resolve())},
+                        skipped_existing=True,
+                    )
+                    continue
+                timeout = int(args.timeout or adapter_obj.timeout_seconds)
+                atol = float(args.atol if args.atol is not None else case_obj.ground_truth.get("atol", adapter_obj.atol))
+                rtol = float(args.rtol if args.rtol is not None else case_obj.ground_truth.get("rtol", adapter_obj.rtol))
+                if isolated_per_case:
+                    report = run_eval(
+                        case_path,
+                        adapter_path,
+                        run_dir,
+                        timeout_override=args.timeout,
+                        atol_override=args.atol,
+                        rtol_override=args.rtol,
+                    )
+                else:
+                    started = _dt.datetime.now(_dt.UTC)
+                    artifact_dir = run_dir / "artifacts"
+                    adapter_key = str(adapter_path.resolve())
+                    try:
+                        pair = worker_pairs.get(adapter_key)
+                        if pair is None:
+                            pair = PersistentWorkerPair(adapter_obj, timeout, out_dir / ".workers" / _slug(adapter_obj.bridge_id))
+                            worker_pairs[adapter_key] = pair
+                        source, target = pair.run_pair(case_obj.code, artifact_dir)
+                        report = build_and_write_eval_report(case_obj, adapter_obj, source, target, run_dir, artifact_dir, started, atol, rtol)
+                    except Exception as exc:
+                        worker_fallback_errors.append(f"{case_obj.id} x {adapter_obj.bridge_id}: {exc}")
+                        report = run_eval(
+                            case_path,
+                            adapter_path,
+                            run_dir,
+                            timeout_override=args.timeout,
+                            atol_override=args.atol,
+                            rtol_override=args.rtol,
+                        )
+                paths = report.pop("_paths")
+                _record_report(report, case_obj, adapter_obj, paths, skipped_existing=False)
+    finally:
+        for pair in worker_pairs.values():
+            pair.close()
     total = passed + failed
     suite_duration = (_dt.datetime.now(_dt.UTC) - suite_started).total_seconds()
     ledger_migration_samples = ledger.get("migration_samples") or []
@@ -1293,10 +2013,22 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
         "suite_id": suite_id,
         "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
         "suite_path": str(suite_path),
+        "comparison_scope": {
+            "mode": "local-pair",
+            "source": "local source_preamble execution",
+            "target": "local adapter preamble execution",
+            "paper_numeric_baseline": False,
+            "note": "Use GPU PyTorch ground-truth artifacts for formal GPU-vs-NPU numeric accuracy.",
+        },
         "totals": {
             "total": total,
+            "completed": total,
             "passed": passed,
             "failed": failed,
+            "executed": executed,
+            "skipped": skipped,
+            "resume_enabled": resume_enabled,
+            "worker_mode": worker_mode,
             "compatibility_counted_total": compatibility_total,
             "compatibility_counted_passed": compatibility_passed,
             "compatibility_rate": (compatibility_passed / compatibility_total) if compatibility_total else None,
@@ -1305,6 +2037,7 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
         },
         "effort": suite_effort,
         "quality": summarize_quality_metrics(runs),
+        "worker_fallback_errors": worker_fallback_errors,
         "failure_classes": failure_classes,
         "runs": runs,
     }
@@ -1360,6 +2093,66 @@ def cmd_plot_reports(args: argparse.Namespace) -> int:
     )
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
+
+
+def _gpu_reference_case_ids(artifact_root: Path) -> tuple[list[str], list[str]]:
+    ids: list[str] = []
+    errors: list[str] = []
+    summaries = [artifact_root] if artifact_root.name == "summary.json" else sorted(artifact_root.rglob("summary.json"))
+    if artifact_root.is_dir() and (artifact_root / "summary.json").exists():
+        summaries.insert(0, artifact_root / "summary.json")
+    seen_summaries: set[Path] = set()
+    for summary_path in summaries:
+        summary_path = summary_path.resolve()
+        if summary_path in seen_summaries or not summary_path.exists():
+            continue
+        seen_summaries.add(summary_path)
+        try:
+            data = _load_json(summary_path)
+        except BaseException as exc:
+            errors.append(f"{summary_path}: {exc}")
+            continue
+        for key in ("passed_cases", "failed_cases", "cases"):
+            cases = data.get(key) or []
+            if not isinstance(cases, list):
+                continue
+            for item in cases:
+                if isinstance(item, dict) and (item.get("test_case_id") or item.get("case_id")):
+                    ids.append(str(item.get("test_case_id") or item.get("case_id")))
+                elif isinstance(item, str):
+                    ids.append(item)
+    for reference_path in sorted(artifact_root.rglob("reference.json")) if artifact_root.is_dir() else []:
+        try:
+            data = _load_json(reference_path)
+        except BaseException as exc:
+            errors.append(f"{reference_path}: {exc}")
+            continue
+        if data.get("case_id"):
+            ids.append(str(data["case_id"]))
+    return sorted(set(ids)), errors
+
+
+def cmd_gpu_reference_status(args: argparse.Namespace) -> int:
+    artifact_root = Path(args.artifact_root).resolve()
+    gpu_ids, gpu_errors = _gpu_reference_case_ids(artifact_root)
+    suite_ids: list[str] = []
+    suite_errors: list[str] = []
+    if args.suite:
+        suite_ids, suite_errors = _suite_case_ids(Path(args.suite).resolve())
+    overlap = sorted(set(gpu_ids) & set(suite_ids)) if suite_ids else []
+    result = {
+        "ok": not gpu_errors and not suite_errors,
+        "artifact_root": str(artifact_root),
+        "suite": str(Path(args.suite).resolve()) if args.suite else None,
+        "gpu_case_count": len(gpu_ids),
+        "suite_case_count": len(suite_ids) if args.suite else None,
+        "direct_overlap_count": len(overlap) if args.suite else None,
+        "direct_overlap_sample": overlap[:20],
+        "mapping_required": bool(args.suite and gpu_ids and suite_ids and not overlap),
+        "errors": gpu_errors + suite_errors,
+    }
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0 if result["ok"] else 1
 
 
 def _suite_case_ids(suite_path: Path) -> tuple[list[str], list[str]]:
@@ -1489,6 +2282,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_suite.add_argument("--rtol", type=float, default=None, help="Override relative tolerance")
     p_suite.add_argument("--effort-ledger", default=None, help="Path to optional effort ledger JSON")
     p_suite.add_argument("--ar-baseline", default=None, help="Path to AR baseline.json calibration artifact")
+    p_suite.add_argument("--no-resume", action="store_true", help="Re-run all cases even when per-case reports already exist")
+    p_suite.add_argument(
+        "--isolated-per-case",
+        action="store_true",
+        help="Debug mode: start fresh source/target Python subprocesses for every case instead of persistent suite workers",
+    )
     p_suite.set_defaults(func=cmd_eval_suite)
 
     p_validate = sub.add_parser("validate-inputs", help="Validate case and adapter JSON files")
@@ -1551,6 +2350,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Generate GPU ground-truth coverage and artifact-completeness figure",
     )
     p_plot.set_defaults(func=cmd_plot_reports)
+
+    p_gpu = sub.add_parser("gpu-reference-status", help="Inspect GPU ground-truth artifacts and suite case-id overlap")
+    p_gpu.add_argument("--artifact-root", required=True, help="GPU ground-truth directory or summary.json")
+    p_gpu.add_argument("--suite", default=None, help="Optional suite JSON to compare by case id")
+    p_gpu.set_defaults(func=cmd_gpu_reference_status)
 
     p_cache = sub.add_parser("cache-status", help="Find reusable generated adapter/suite caches")
     p_cache.add_argument("--bridge-id", required=True, help="Bridge id to match in adapter.generated.json")

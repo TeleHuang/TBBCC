@@ -43,6 +43,7 @@ Read these files before nontrivial work:
    by case ids/case count. Prefer the newest valid match. Reuse its
    `adapter.generated.json` and `suite.generated.json` by default, and say
    which cache directory was reused.
+   This is config cache reuse only.
 4. Explicitly skip cache only when the user asks for fresh generation, for
    example `fresh`, `regenerate`, `no-cache`, `重新生成`, `不要缓存`, or
    `重新写 adapter/suite`. In that case create new adapter/suite artifacts.
@@ -89,23 +90,48 @@ Read these files before nontrivial work:
    python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval-suite --suite <suite.json> --out <out-dir>
    ```
 
+   `eval-suite` resumes per-case results by default. If `runs/<case>__<bridge>/report.json`
+   is already present, structurally valid, and compact enough to load safely,
+   it is counted as skipped rather than re-executed. Use `--no-resume` only
+   when the user explicitly asks for a full fresh rerun.
+   `eval-suite` also uses persistent source/target workers by default, so the
+   baseline interpreter and bridge interpreter each initialize once per suite
+   instead of once per case. Do not add `--isolated-per-case` unless debugging
+   import-order or process-isolation behavior.
 12. For a single explicit case, run:
 
    ```bash
    python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py eval --case <case.json> --adapter <adapter.json> --out <out-dir>
    ```
 
-13. Read the generated report or summary before concluding.
-14. Always state whether cache was reused or fresh artifacts were generated.
-15. Always state the benchmark scope, sample size, and actual backend/device in
+13. Treat numeric semantics explicitly:
+   - `eval` and `eval-suite` currently produce `comparison_scope.mode=local-pair`.
+     This compares local source execution against local adapter execution and is
+     valid for adapter/backend/harness diagnostics.
+   - Do not present local-pair `NumericMismatch` as the formal paper claim for
+     GPU PyTorch vs Ascend NPU bridge accuracy.
+   - For formal GPU-vs-NPU numeric analysis, first inspect GPU artifacts:
+
+     ```bash
+     python ${CLAUDE_PLUGIN_ROOT}/scripts/tbbcc.py gpu-reference-status --artifact-root <gpu-artifact-root> --suite <suite.json>
+     ```
+
+     If `mapping_required=true`, create or request a case-id mapping before
+     plotting or reporting GPU-vs-NPU numeric metrics.
+14. Read the generated report or summary before concluding.
+15. Always state whether cache was reused or fresh artifacts were generated.
+    Also state whether result resume skipped existing cases or all cases were
+    freshly executed, and state the suite `worker_mode`.
+16. Always state the benchmark scope, sample size, actual backend/device, and
+    comparison scope in
     the final response. If simple cases such as ReLU or reshape fail with broad
     NumericMismatch and cosine near zero, audit adapter/backend configuration
     before concluding the bridge is internally wrong.
-16. Always state the benchmark scope and sample size in the final response, for
+17. Always state the benchmark scope and sample size in the final response, for
     example `0/4 smoke cases` versus `160/175 full benchmark cases`. Never imply
     that a smoke result represents the full benchmark.
-17. Confirm failure classification before repair when the result is nontrivial.
-18. Repair only migration-side files unless the user explicitly asks for bridge
+18. Confirm failure classification before repair when the result is nontrivial.
+19. Repair only migration-side files unless the user explicitly asks for bridge
    internals.
 
 ## Constraints
@@ -120,3 +146,12 @@ Read these files before nontrivial work:
   convenience defaults. Full evaluation is the default; smoke/dev is opt-in.
 - Do not regenerate adapter/suite files when a valid cache exists unless the
   user explicitly asks for regeneration.
+- Do not merge GPU ground-truth artifacts into CC reports or figures when case
+  ids have no direct overlap and no reviewed mapping exists.
+- Do not classify RNG/input mismatch, adapter incompleteness, or worker protocol
+  contamination as bridge-internal compatibility failures.
+- Do not use `--no-resume` unless the user explicitly requests a fresh rerun.
+  Long full-suite runs must be resumable after interruption.
+- Do not use `--isolated-per-case` for normal full-suite evaluation. It exists
+  only as a debugging fallback because repeated NPU/MindSpore initialization
+  can dominate runtime.

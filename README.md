@@ -42,6 +42,13 @@ For a normal bridge evaluation, the plugin defaults to reusing a valid cached
 and suite scope match. Say `fresh`, `regenerate`, `no-cache`, or `重新生成` when
 you want new artifacts. If no suite is specified, the default scope remains the
 full 175-case benchmark unless you explicitly ask for a quick smoke/dev run.
+Suite execution also resumes per-case results by default: existing valid
+`runs/<case>__<bridge>/report.json` files are skipped and counted in the final
+summary. Use `--no-resume` only when you intentionally want a full fresh rerun.
+For performance, `eval-suite` uses persistent source/target workers by default:
+the PyTorch baseline side and bridge target side each initialize once per suite,
+not once per case. Use `--isolated-per-case` only for debugging process
+isolation or import-order issues.
 
 Claude Code 2.1.183 does not provide `claude plugin add`. Use `--plugin-dir`
 for local manual checks, or the marketplace/install workflow for packaged
@@ -101,6 +108,60 @@ Rebuild the library after editing the generator:
 python scripts/generate_benchmark_library.py
 ```
 
+## GPU Reference Collection
+
+Formal numerical accuracy uses a GPU PyTorch reference versus an Ascend NPU
+bridge result. The GPU reference must be collected from the same canonical
+benchmark suite used by the NPU run. The canonical case id is the `id` field in
+`benchmarks/v1.0.0/cases/**/*.json`; do not create a separate GPU-only case id
+scheme.
+
+On the GPU server, run:
+
+```bash
+cd /path/to/torchbridgebenchCCplugin
+python scripts/tbbcc_gpu_reference.py \
+  --suite benchmarks/v1.0.0/suites/all_noop.json \
+  --out reports/gpu_reference_all_noop \
+  --device cuda
+```
+
+For a quick local smoke test without CUDA:
+
+```bash
+python scripts/tbbcc_gpu_reference.py \
+  --suite benchmarks/v1.0.0/suites/dev_noop.json \
+  --out reports/gpu_reference_dev_cpu \
+  --device cpu
+```
+
+The collector writes:
+
+```text
+reports/gpu_reference_all_noop/
+├── manifest.json
+├── summary.json
+└── cases/<canonical-case-slug>/reference.json
+```
+
+Each `reference.json` stores the canonical `case_id`, `case_sha256`,
+environment metadata, result summaries, activation summaries, gradient
+summaries, task metrics, and `.npy` tensor artifacts. See
+`references/unified-case-system.md` for the full contract.
+
+To verify whether an existing GPU artifact directory can be aligned with a
+suite:
+
+```bash
+python scripts/tbbcc.py gpu-reference-status \
+  --artifact-root reports/gpu_reference_all_noop \
+  --suite benchmarks/v1.0.0/suites/all_noop.json
+```
+
+If `mapping_required=true`, the artifact ids do not directly match the suite's
+canonical case ids and must not be used for formal GPU-vs-NPU plots until a
+reviewed mapping file exists.
+
 ## Validation
 
 Validate the plugin manifest and inspect the plugin inventory:
@@ -154,7 +215,10 @@ variance estimate rather than a single exhaustive pass.
 ## Output
 
 Benchmark runs write JSON and Markdown reports into the output directory you
-choose. Suite runs also write a summary file under `runs/`.
+choose. Suite runs also write `summary.json` and `summary.md` in the selected
+output directory. Reports are compact by default: large tensors are stored as
+shape/dtype/sample/hash/statistical summaries plus numeric comparison metrics,
+not as full tensor payloads.
 
 For bridge developers, start with
 `references/bridge-developer-quickstart.md`. It explains how to run a suite and
