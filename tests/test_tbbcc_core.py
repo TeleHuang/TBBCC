@@ -14,6 +14,7 @@ import tbbcc  # noqa: E402
 import tbbcc_bridge_artifacts  # noqa: E402
 import tbbcc_compare_artifacts  # noqa: E402
 import tbbcc_gpu_reference  # noqa: E402
+import tbbcc_model_suite  # noqa: E402
 
 
 def test_resolve_path_uses_suite_parent(tmp_path: Path) -> None:
@@ -653,6 +654,86 @@ def test_artifact_compare_matches_gpu_and_bridge_outputs(tmp_path: Path, capsys:
     assert summary["runs"][0]["channels"]["result"]["passed"] is True
     assert summary["runs"][0]["channels"]["activations"]["passed"] is True
     assert summary["runs"][0]["channels"]["gradients"]["passed"] is True
+
+
+def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    np = pytest.importorskip("numpy")
+    registry = ROOT / "benchmarks" / "model_zoo" / "registry.json"
+    suite = ROOT / "benchmarks" / "model_zoo" / "suites" / "canonical_models.json"
+    models = json.loads(registry.read_text(encoding="utf-8"))["models"]
+    gpu_root = tmp_path / "gpu_models"
+    npu_root = tmp_path / "npu_models"
+    out = tmp_path / "compare"
+
+    def write_tensor(root: Path, model_id: str, channel: str, name: str, value: float) -> dict[str, object]:
+        path = root / model_id / "artifacts" / channel / f"{name}.npy"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        arr = np.asarray([value, value + 1.0], dtype=np.float32)
+        np.save(path, arr, allow_pickle=False)
+        return {
+            "__tbbcc_model_tensor__": True,
+            "shape": [2],
+            "dtype": "float32",
+            "numel": 2,
+            "artifact_path": str(path.relative_to(root)),
+        }
+
+    for model in models:
+        model_id = model["model_id"]
+        activation_layers = model["hooks"]["activation_layers"]
+        gradient_layers = model["hooks"]["gradient_layers"]
+        for root, role, drift in [(gpu_root, "gpu-reference", 0.0), (npu_root, "npu-bridge", 0.0)]:
+            channels = {
+                "result": write_tensor(root, model_id, "result", "output", 1.0),
+                "activations": {
+                    layer: write_tensor(root, model_id, "activations", f"activation_{layer}", 1.0)
+                    for layer in activation_layers
+                },
+                "gradients": {
+                    layer: write_tensor(root, model_id, "gradients", f"gradient_{layer}", 1.0)
+                    for layer in gradient_layers
+                },
+                "task_metrics": {"latency_ms": 1.0},
+            }
+            if role == "npu-bridge" and model_id == "resnet18_imagenet_224":
+                # Drift the second registry-ordered activation to verify first-divergence ordering.
+                channels["activations"][activation_layers[1]] = write_tensor(root, model_id, "activations", f"activation_{activation_layers[1]}", 9.0 + drift)
+            artifact = {
+                "schema_version": "tbbcc.model_artifact.v1",
+                "model_id": model_id,
+                "role": role,
+                "status": "passed",
+                "channels": channels,
+                "figure_role": model["figure_role"],
+            }
+            artifact_path = root / model_id / "model_artifact.json"
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
+    (gpu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
+    (npu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
+
+    class Args:
+        pass
+
+    Args.registry = str(registry)
+    Args.suite = str(suite)
+    Args.gpu_reference = str(gpu_root)
+    Args.npu_bridge = str(npu_root)
+    Args.out = str(out)
+    Args.atol = 0.0
+    Args.rtol = 0.0
+    Args.cosine_threshold = 0.999
+
+    assert tbbcc_model_suite.cmd_compare(Args()) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["totals"]["models"] == 4
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert {item["figure_id"] for item in summary["figure_candidates"]} == {
+        "canonical_layerwise_fne",
+        "canonical_gradient_consistency",
+    }
+    resnet = next(item for item in summary["models"] if item["model_id"] == "resnet18_imagenet_224")
+    assert resnet["first_divergence_layer"] == "layer1"
 
 
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:

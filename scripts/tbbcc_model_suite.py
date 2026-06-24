@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""Collect and compare canonical model-suite GPU/NPU artifacts.
+
+The generated 175-case benchmark remains the broad compatibility suite. This
+module handles the smaller canonical model suite used for layer-wise numerical
+figures and task-level drift analysis.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import math
+import os
+import platform
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+
+import tbbcc  # noqa: E402
+
+
+SCHEMA_REGISTRY = "tbbcc.model_zoo.registry.v1"
+SCHEMA_SUITE = "tbbcc.model_suite.v1"
+SCHEMA_ARTIFACT = "tbbcc.model_artifact.v1"
+SCHEMA_MANIFEST = "tbbcc.model_artifact_manifest.v1"
+SCHEMA_COMPARISON = "tbbcc.model_suite_comparison.v1"
+TENSOR_KEY = "__tbbcc_model_tensor__"
+
+
+def _load_json(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise SystemExit(f"Expected JSON object in {path}")
+    return data
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "item"):
+        return value.item()
+    return str(value)
+
+
+def _model_by_id(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(item["model_id"]): item for item in registry.get("models", []) if isinstance(item, dict)}
+
+
+def _selected_models(registry_path: Path, suite_path: Path) -> list[dict[str, Any]]:
+    registry = _load_json(registry_path)
+    suite = _load_json(suite_path)
+    validate_registry_payload(registry, suite)
+    models = _model_by_id(registry)
+    return [models[str(model_id)] for model_id in suite["model_ids"]]
+
+
+def validate_registry_payload(registry: dict[str, Any], suite: dict[str, Any] | None = None) -> list[str]:
+    errors: list[str] = []
+    if registry.get("schema_version") != SCHEMA_REGISTRY:
+        errors.append(f"registry.schema_version must be {SCHEMA_REGISTRY}")
+    models = registry.get("models")
+    if not isinstance(models, list) or not models:
+        errors.append("registry.models must be a non-empty list")
+        return errors
+    seen: set[str] = set()
+    for index, model in enumerate(models):
+        if not isinstance(model, dict):
+            errors.append(f"models[{index}] must be an object")
+            continue
+        model_id = str(model.get("model_id") or "")
+        if not model_id:
+            errors.append(f"models[{index}].model_id is required")
+        if model_id in seen:
+            errors.append(f"duplicate model_id: {model_id}")
+        seen.add(model_id)
+        for field in ("display_name", "task", "architecture_family", "pretrained_weights", "metrics", "hooks", "figure_role"):
+            if not model.get(field):
+                errors.append(f"{model_id or index} missing {field}")
+        weights = model.get("pretrained_weights") or {}
+        if not isinstance(weights, dict) or not weights.get("source") or not weights.get("locator"):
+            errors.append(f"{model_id or index} pretrained_weights must include source and locator")
+        hooks = model.get("hooks") or {}
+        if not isinstance(hooks, dict) or not hooks.get("activation_layers") or not hooks.get("gradient_layers"):
+            errors.append(f"{model_id or index} hooks must include activation_layers and gradient_layers")
+        if not isinstance(model.get("metrics"), list) or not model.get("metrics"):
+            errors.append(f"{model_id or index} metrics must be a non-empty list")
+
+    if suite is not None:
+        if suite.get("schema_version") != SCHEMA_SUITE:
+            errors.append(f"suite.schema_version must be {SCHEMA_SUITE}")
+        model_ids = suite.get("model_ids")
+        if not isinstance(model_ids, list) or not model_ids:
+            errors.append("suite.model_ids must be a non-empty list")
+        else:
+            missing = [str(model_id) for model_id in model_ids if str(model_id) not in seen]
+            if missing:
+                errors.append(f"suite references unknown model_ids: {missing}")
+    return errors
+
+
+def _artifact_rel(path: Path, root: Path) -> str:
+    return str(path.resolve().relative_to(root.resolve()))
+
+
+def _summarize_tensor(value: Any, artifact_dir: Path, artifact_root: Path, name: str) -> dict[str, Any]:
+    import numpy as np  # type: ignore
+    import torch  # type: ignore
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    if isinstance(value, torch.Tensor):
+        arr = value.detach().float().cpu().numpy()
+        dtype = str(value.dtype)
+        device = str(value.device)
+    else:
+        arr = np.asarray(value)
+        dtype = str(arr.dtype)
+        device = None
+    arr = np.ascontiguousarray(arr)
+    safe = tbbcc._slug(name)
+    path = artifact_dir / f"{safe}.npy"
+    np.save(path, arr, allow_pickle=False)
+    flat = arr.reshape(-1)
+    finite = flat[np.isfinite(flat)] if np.issubdtype(arr.dtype, np.number) else np.array([])
+    summary: dict[str, Any] = {
+        TENSOR_KEY: True,
+        "shape": [int(x) for x in arr.shape],
+        "dtype": dtype,
+        "device": device,
+        "numel": int(arr.size),
+        "sha256": hashlib.sha256(arr.view(np.uint8)).hexdigest(),
+        "artifact_path": _artifact_rel(path, artifact_root),
+        "artifact_format": "npy",
+        "sample": flat[:8].tolist(),
+    }
+    if finite.size:
+        summary.update(
+            {
+                "min": float(finite.min()),
+                "max": float(finite.max()),
+                "mean": float(finite.mean()),
+                "std": float(finite.std()),
+            }
+        )
+    return summary
+
+
+def _environment(role: str, device: str) -> dict[str, Any]:
+    env: dict[str, Any] = {
+        "role": role,
+        "device_requested": device,
+        "python": platform.python_version(),
+        "python_executable": sys.executable,
+        "platform": platform.platform(),
+    }
+    try:
+        import torch  # type: ignore
+
+        env["torch"] = getattr(torch, "__version__", "present")
+        env["cuda_available"] = bool(torch.cuda.is_available())
+        env["cuda"] = getattr(torch.version, "cuda", None)
+        if torch.cuda.is_available():
+            env["gpu_count"] = int(torch.cuda.device_count())
+            env["gpu_name"] = torch.cuda.get_device_name(0)
+    except Exception as exc:
+        env["torch_error"] = repr(exc)
+    return env
+
+
+class _UNetBlock:
+    pass
+
+
+def _build_unet_small() -> Any:
+    import torch  # type: ignore
+
+    class DoubleConv(torch.nn.Module):
+        def __init__(self, in_ch: int, out_ch: int):
+            super().__init__()
+            self.net = torch.nn.Sequential(
+                torch.nn.Conv2d(in_ch, out_ch, 3, padding=1),
+                torch.nn.BatchNorm2d(out_ch),
+                torch.nn.ReLU(inplace=True),
+                torch.nn.Conv2d(out_ch, out_ch, 3, padding=1),
+                torch.nn.BatchNorm2d(out_ch),
+                torch.nn.ReLU(inplace=True),
+            )
+
+        def forward(self, x: Any) -> Any:
+            return self.net(x)
+
+    class UNetSmall(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.enc1 = DoubleConv(3, 16)
+            self.pool1 = torch.nn.MaxPool2d(2)
+            self.enc2 = DoubleConv(16, 32)
+            self.pool2 = torch.nn.MaxPool2d(2)
+            self.bottleneck = DoubleConv(32, 64)
+            self.up2 = torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+            self.dec2 = DoubleConv(96, 32)
+            self.up1 = torch.nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False)
+            self.dec1 = DoubleConv(48, 16)
+            self.out = torch.nn.Conv2d(16, 2, 1)
+
+        def forward(self, x: Any) -> Any:
+            e1 = self.enc1(x)
+            e2 = self.enc2(self.pool1(e1))
+            b = self.bottleneck(self.pool2(e2))
+            d2 = self.dec2(torch.cat([self.up2(b), e2], dim=1))
+            d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+            return self.out(d1)
+
+    return UNetSmall()
+
+
+def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) -> tuple[Any, dict[str, Any]]:
+    import torch  # type: ignore
+
+    os.environ.setdefault("TORCH_HOME", str(cache_dir / "torch"))
+    os.environ.setdefault("HF_HOME", str(cache_dir / "hf"))
+    os.environ.setdefault("TIMM_HOME", str(cache_dir / "timm"))
+    model_id = str(model["model_id"])
+    checkpoint: dict[str, Any] = {
+        "source": (model.get("pretrained_weights") or {}).get("source"),
+        "locator": (model.get("pretrained_weights") or {}).get("locator"),
+        "pretrained_requested": pretrained,
+        "sha256": None,
+    }
+    if model_id == "resnet18_imagenet_224":
+        from torchvision.models import ResNet18_Weights, resnet18  # type: ignore
+
+        weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
+        return resnet18(weights=weights).eval(), checkpoint
+    if model_id == "mobilenetv2_imagenet_224":
+        from torchvision.models import MobileNet_V2_Weights, mobilenet_v2  # type: ignore
+
+        weights = MobileNet_V2_Weights.IMAGENET1K_V1 if pretrained else None
+        return mobilenet_v2(weights=weights).eval(), checkpoint
+    if model_id == "vit_tiny_imagenet_224":
+        import timm  # type: ignore
+
+        return timm.create_model("vit_tiny_patch16_224", pretrained=pretrained).eval(), checkpoint
+    if model_id == "unet_small_biosample_256":
+        net = _build_unet_small().eval()
+        checkpoint_path = cache_dir / "unet_small_biosample_256" / "checkpoint.pt"
+        if checkpoint_path.exists():
+            state = torch.load(checkpoint_path, map_location="cpu")
+            net.load_state_dict(state.get("state_dict", state))
+            checkpoint["local_path"] = str(checkpoint_path)
+            checkpoint["sha256"] = _sha256_file(checkpoint_path)
+        elif pretrained:
+            checkpoint["warning"] = "No UNet checkpoint found; using deterministic initialized weights for bootstrap only."
+        return net, checkpoint
+    raise SystemExit(f"Unsupported model_id: {model_id}")
+
+
+def _resolve_device(role: str, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "cuda" if role == "gpu-reference" else "cpu"
+
+
+def _prepare_input(
+    model: dict[str, Any],
+    *,
+    model_dir: Path,
+    input_root: Path | None,
+    device: str,
+    seed: int,
+) -> tuple[Any, dict[str, Any]]:
+    import numpy as np  # type: ignore
+    import torch  # type: ignore
+
+    model_id = str(model["model_id"])
+    if input_root is not None:
+        source = input_root / model_id / "inputs" / "input.npy"
+        if not source.exists():
+            raise SystemExit(f"Missing shared input artifact for {model_id}: {source}")
+        arr = np.load(source, allow_pickle=False)
+        tensor = torch.from_numpy(arr).to(device)
+        return tensor, {"source": str(source.resolve()), "sha256": _sha256_file(source), "shared_input": True}
+
+    shape = [int(x) for x in model.get("input_shape", [1, 3, 224, 224])]
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    tensor_cpu = torch.randn(*shape, generator=generator, dtype=torch.float32)
+    input_dir = model_dir / "inputs"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    path = input_dir / "input.npy"
+    np.save(path, tensor_cpu.numpy(), allow_pickle=False)
+    return tensor_cpu.to(device), {"source": _artifact_rel(path, model_dir.parent), "sha256": _sha256_file(path), "shared_input": False}
+
+
+def _register_activation_hooks(model: Any, layers: list[str], store: dict[str, Any]) -> list[Any]:
+    modules = dict(model.named_modules())
+    handles = []
+    for name in layers:
+        module = modules.get(name)
+        if module is None:
+            store[name] = {"missing": True}
+            continue
+
+        def _hook(_module: Any, _inputs: Any, output: Any, *, layer_name: str = name) -> None:
+            value = output[0] if isinstance(output, (tuple, list)) else output
+            store[layer_name] = value
+
+        handles.append(module.register_forward_hook(_hook))
+    return handles
+
+
+def _register_gradient_hooks(model: Any, layers: list[str], store: dict[str, Any]) -> list[Any]:
+    modules = dict(model.named_modules())
+    handles = []
+    for name in layers:
+        module = modules.get(name)
+        if module is None:
+            store[name] = {"missing": True}
+            continue
+        param = next(module.parameters(recurse=True), None)
+        if param is None:
+            store[name] = {"missing": True, "reason": "no_parameter"}
+            continue
+
+        def _hook(grad: Any, *, layer_name: str = name) -> None:
+            store[layer_name] = grad
+
+        handles.append(param.register_hook(_hook))
+    return handles
+
+
+def _task_metrics(model: dict[str, Any], output: Any, duration_seconds: float, batch_size: int) -> dict[str, Any]:
+    import torch  # type: ignore
+
+    metrics: dict[str, Any] = {
+        "latency_ms": duration_seconds * 1000.0,
+        "throughput_img_s": batch_size / duration_seconds if duration_seconds > 0 else None,
+    }
+    if isinstance(output, torch.Tensor):
+        metrics["output_shape"] = [int(x) for x in output.shape]
+        if output.ndim == 2 and output.shape[1] >= 5:
+            _, top = output.detach().float().cpu().topk(5, dim=1)
+            metrics["top5_indices_sample"] = top[: min(4, top.shape[0])].tolist()
+    return metrics
+
+
+def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_path: Path, suite_path: Path) -> dict[str, Any]:
+    import torch  # type: ignore
+
+    role = str(args.role)
+    device_name = _resolve_device(role, str(args.device))
+    if role == "gpu-reference" and device_name == "cuda" and not torch.cuda.is_available() and not bool(args.allow_cpu_fallback):
+        raise SystemExit("CUDA is not available. Use --device cpu only for smoke tests.")
+
+    if args.adapter:
+        adapter = tbbcc.load_adapter(Path(args.adapter).resolve())
+        namespace = {"__name__": "__tbbcc_model_bridge_preamble__"}
+        exec(adapter.preamble, namespace, namespace)
+
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
+    torch.set_grad_enabled(True)
+
+    cache_dir = Path(os.environ.get("TBBCC_MODEL_CACHE") or args.model_cache).expanduser().resolve()
+    model_id = str(model["model_id"])
+    out_dir = Path(args.out).resolve()
+    model_dir = out_dir / model_id
+    artifact_dir = model_dir / "artifacts"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    net, checkpoint = _build_model(model, pretrained=not bool(args.no_pretrained), cache_dir=cache_dir)
+    device = torch.device(device_name)
+    net.to(device)
+    x, input_meta = _prepare_input(
+        model,
+        model_dir=model_dir,
+        input_root=Path(args.input_root).resolve() if args.input_root else None,
+        device=device_name,
+        seed=int(args.seed),
+    )
+    x.requires_grad_(True)
+    activations_raw: dict[str, Any] = {}
+    gradients_raw: dict[str, Any] = {}
+    handles = []
+    hooks = model.get("hooks") or {}
+    handles.extend(_register_activation_hooks(net, [str(x) for x in hooks.get("activation_layers", [])], activations_raw))
+    handles.extend(_register_gradient_hooks(net, [str(x) for x in hooks.get("gradient_layers", [])], gradients_raw))
+    started = time.perf_counter()
+    with torch.set_grad_enabled(True):
+        output = net(x)
+        loss = output.float().mean()
+        loss.backward()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    duration = time.perf_counter() - started
+    for handle in handles:
+        handle.remove()
+
+    activations = {
+        name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "activations", out_dir, f"activation_{name}")
+        for name, value in activations_raw.items()
+    }
+    gradients = {
+        name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "gradients", out_dir, f"gradient_{name}")
+        for name, value in gradients_raw.items()
+    }
+    result = _summarize_tensor(output, artifact_dir / "result", out_dir, "output")
+    metrics = _task_metrics(model, output, duration, int(x.shape[0]))
+    if device.type == "cuda":
+        metrics["peak_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
+    else:
+        metrics["peak_memory_mb"] = None
+    metrics["loss_scalar"] = float(loss.detach().float().cpu())
+    artifact = {
+        "schema_version": SCHEMA_ARTIFACT,
+        "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+        "model_id": model_id,
+        "display_name": model.get("display_name"),
+        "role": role,
+        "status": "passed",
+        "registry_path": str(registry_path),
+        "suite_path": str(suite_path),
+        "environment": _environment(role, device_name),
+        "checkpoint": checkpoint,
+        "input": input_meta,
+        "channels": {
+            "result": result,
+            "activations": activations,
+            "gradients": gradients,
+            "task_metrics": metrics,
+        },
+        "figure_role": model.get("figure_role"),
+    }
+    artifact_path = model_dir / "model_artifact.json"
+    artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    return {
+        "model_id": model_id,
+        "status": "passed",
+        "artifact_json": str(artifact_path.resolve()),
+        "figure_role": model.get("figure_role"),
+        "activation_layers": len(activations),
+        "gradient_layers": len(gradients),
+    }
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    registry = _load_json(Path(args.registry).resolve())
+    suite = _load_json(Path(args.suite).resolve()) if args.suite else None
+    errors = validate_registry_payload(registry, suite)
+    print(json.dumps({"ok": not errors, "errors": errors}, indent=2, ensure_ascii=False))
+    return 0 if not errors else 1
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    registry_path = Path(args.registry).resolve()
+    suite_path = Path(args.suite).resolve()
+    models = _selected_models(registry_path, suite_path)
+    plan = {
+        "schema_version": "tbbcc.model_suite.plan.v1",
+        "registry": str(registry_path),
+        "suite": str(suite_path),
+        "model_count": len(models),
+        "models": [
+            {
+                "model_id": item["model_id"],
+                "display_name": item.get("display_name"),
+                "figure_role": item.get("figure_role"),
+                "activation_layers": item.get("hooks", {}).get("activation_layers", []),
+                "gradient_layers": item.get("hooks", {}).get("gradient_layers", []),
+                "metrics": item.get("metrics", []),
+            }
+            for item in models
+        ],
+        "figure_contract": {
+            "core_conclusion": "Canonical models identify where NPU bridge execution first diverges from GPU PyTorch reference and whether that drift propagates to gradients or short training.",
+            "archetype": "quantitative grid",
+            "primary_panels": ["layerwise_fne_curve", "first_divergence_layer", "gradient_consistency_curve", "loss_curve_dtw"],
+            "exports": ["pdf", "svg", "tiff"],
+        },
+    }
+    if args.out:
+        out = Path(args.out).resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(plan, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(plan, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_collect(args: argparse.Namespace) -> int:
+    registry_path = Path(args.registry).resolve()
+    suite_path = Path(args.suite).resolve()
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    selected = _selected_models(registry_path, suite_path)
+    requested = set(args.model_id or [])
+    if requested:
+        selected = [item for item in selected if item["model_id"] in requested]
+    started = _dt.datetime.now(_dt.UTC)
+    cases: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for model in selected:
+        try:
+            cases.append(_run_one_model(args, model, registry_path, suite_path))
+        except Exception as exc:
+            failures.append({"model_id": model.get("model_id"), "status": "failed", "error": repr(exc)})
+            if not bool(args.keep_going):
+                raise
+    manifest = {
+        "schema_version": SCHEMA_MANIFEST,
+        "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+        "role": args.role,
+        "registry": str(registry_path),
+        "suite": str(suite_path),
+        "totals": {
+            "total": len(cases) + len(failures),
+            "passed": len(cases),
+            "failed": len(failures),
+            "duration_seconds": (_dt.datetime.now(_dt.UTC) - started).total_seconds(),
+        },
+        "cases": cases + failures,
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps({"manifest_json": str((out_dir / "manifest.json").resolve()), "totals": manifest["totals"]}, indent=2))
+    return 0 if not failures else 1
+
+
+def _artifact_path(root: Path, model_id: str) -> Path:
+    return root / model_id / "model_artifact.json"
+
+
+def _load_array(summary: dict[str, Any], root: Path) -> Any:
+    import numpy as np  # type: ignore
+
+    artifact = summary.get("artifact_path")
+    if not artifact:
+        return None
+    path = Path(str(artifact))
+    if not path.is_absolute():
+        path = root / path
+    return np.load(path, allow_pickle=False)
+
+
+def _numeric_compare(a: Any, b: Any, atol: float, rtol: float) -> dict[str, Any]:
+    import numpy as np  # type: ignore
+
+    if a is None or b is None:
+        return {"passed": False, "reason": "MissingArtifact"}
+    if tuple(a.shape) != tuple(b.shape):
+        return {"passed": False, "reason": "ShapeMismatch", "gpu_shape": list(a.shape), "npu_shape": list(b.shape)}
+    av = a.reshape(-1).astype("float64", copy=False)
+    bv = b.reshape(-1).astype("float64", copy=False)
+    diff = np.abs(av - bv)
+    close = diff <= (atol + rtol * np.abs(bv))
+    dot = float(np.dot(av, bv))
+    norm = float(np.linalg.norm(av) * np.linalg.norm(bv))
+    cosine = dot / norm if norm > 0 else None
+    finite = diff[np.isfinite(diff)]
+    return {
+        "passed": bool(np.all(close)),
+        "reason": None if bool(np.all(close)) else "NumericMismatch",
+        "count": int(av.size),
+        "mae": float(np.mean(finite)) if finite.size else float("inf"),
+        "max_error": float(np.max(diff)) if diff.size else 0.0,
+        "p95": float(np.percentile(finite, 95)) if finite.size else float("inf"),
+        "cosine": cosine,
+        "failed_count": int(np.size(close) - np.count_nonzero(close)),
+        "atol": atol,
+        "rtol": rtol,
+    }
+
+
+def _compare_named_channel(
+    gpu: dict[str, Any],
+    npu: dict[str, Any],
+    gpu_root: Path,
+    npu_root: Path,
+    atol: float,
+    rtol: float,
+    order: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    ordered = [str(item) for item in (order or [])]
+    extras = sorted((set(gpu) | set(npu)) - set(ordered))
+    names = ordered + extras
+    for name in names:
+        gv = gpu.get(name)
+        nv = npu.get(name)
+        if not isinstance(gv, dict) or not isinstance(nv, dict) or gv.get("missing") or nv.get("missing"):
+            rows.append({"name": name, "passed": False, "reason": "MissingLayer"})
+            continue
+        metrics = _numeric_compare(_load_array(gv, gpu_root), _load_array(nv, npu_root), atol, rtol)
+        rows.append({"name": name, **metrics})
+    return rows
+
+
+def _first_divergence(rows: list[dict[str, Any]], threshold: float) -> str | None:
+    for row in rows:
+        cosine = row.get("cosine")
+        if row.get("passed") is False or (isinstance(cosine, (int, float)) and cosine < threshold):
+            return str(row.get("name"))
+    return None
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    registry_path = Path(args.registry).resolve()
+    suite_path = Path(args.suite).resolve()
+    gpu_root = Path(args.gpu_reference).resolve()
+    npu_root = Path(args.npu_bridge).resolve()
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    models = _selected_models(registry_path, suite_path)
+    results: list[dict[str, Any]] = []
+    for model in models:
+        model_id = str(model["model_id"])
+        gpu = _load_json(_artifact_path(gpu_root, model_id))
+        npu = _load_json(_artifact_path(npu_root, model_id))
+        channels_g = gpu.get("channels") or {}
+        channels_n = npu.get("channels") or {}
+        output = _numeric_compare(
+            _load_array(channels_g.get("result") or {}, gpu_root),
+            _load_array(channels_n.get("result") or {}, npu_root),
+            float(args.atol),
+            float(args.rtol),
+        )
+        hooks = model.get("hooks") or {}
+        fne = _compare_named_channel(
+            channels_g.get("activations") or {},
+            channels_n.get("activations") or {},
+            gpu_root,
+            npu_root,
+            float(args.atol),
+            float(args.rtol),
+            [str(item) for item in hooks.get("activation_layers", [])],
+        )
+        gc = _compare_named_channel(
+            channels_g.get("gradients") or {},
+            channels_n.get("gradients") or {},
+            gpu_root,
+            npu_root,
+            float(args.atol),
+            float(args.rtol),
+            [str(item) for item in hooks.get("gradient_layers", [])],
+        )
+        results.append(
+            {
+                "model_id": model_id,
+                "display_name": model.get("display_name"),
+                "figure_role": model.get("figure_role"),
+                "passed": bool(output.get("passed") and all(row.get("passed") is not False for row in fne)),
+                "output_drift": output,
+                "fne_curve": fne,
+                "gc_curve": gc,
+                "first_divergence_layer": _first_divergence(fne, float(args.cosine_threshold)),
+                "gpu_task_metrics": channels_g.get("task_metrics") or {},
+                "npu_task_metrics": channels_n.get("task_metrics") or {},
+            }
+        )
+    figure_candidates = [
+        {
+            "figure_id": "canonical_layerwise_fne",
+            "title": "Layer-wise GPU-NPU forward numerical equivalence",
+            "source": "Canonical Model Suite",
+            "models": [item["model_id"] for item in results],
+            "required_fields": ["fne_curve", "first_divergence_layer"],
+        },
+        {
+            "figure_id": "canonical_gradient_consistency",
+            "title": "Gradient consistency across canonical models",
+            "source": "Canonical Model Suite",
+            "models": [item["model_id"] for item in results if item.get("gc_curve")],
+            "required_fields": ["gc_curve"],
+        },
+    ]
+    summary = {
+        "schema_version": SCHEMA_COMPARISON,
+        "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+        "registry": str(registry_path),
+        "suite": str(suite_path),
+        "gpu_reference": str(gpu_root),
+        "npu_bridge": str(npu_root),
+        "totals": {
+            "models": len(results),
+            "passed": sum(1 for item in results if item.get("passed")),
+            "failed": sum(1 for item in results if not item.get("passed")),
+        },
+        "figure_candidates": figure_candidates,
+        "models": results,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    print(json.dumps({"summary_json": str((out_dir / "summary.json").resolve()), "totals": summary["totals"]}, indent=2))
+    return 0 if summary["totals"]["failed"] == 0 else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Canonical model-suite GPU/NPU artifact workflow")
+    sub = parser.add_subparsers(dest="command", required=True)
+    default_registry = "benchmarks/model_zoo/registry.json"
+    default_suite = "benchmarks/model_zoo/suites/canonical_models.json"
+
+    p_validate = sub.add_parser("validate", help="Validate model registry and suite metadata")
+    p_validate.add_argument("--registry", default=default_registry)
+    p_validate.add_argument("--suite", default=default_suite)
+    p_validate.set_defaults(func=cmd_validate)
+
+    p_plan = sub.add_parser("plan", help="Print the canonical model experiment and figure plan")
+    p_plan.add_argument("--registry", default=default_registry)
+    p_plan.add_argument("--suite", default=default_suite)
+    p_plan.add_argument("--out", default=None)
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_collect = sub.add_parser("collect", help="Collect model artifacts for GPU reference or NPU bridge")
+    p_collect.add_argument("--registry", default=default_registry)
+    p_collect.add_argument("--suite", default=default_suite)
+    p_collect.add_argument("--out", required=True)
+    p_collect.add_argument("--role", choices=["gpu-reference", "npu-bridge"], required=True)
+    p_collect.add_argument("--device", default="auto", help="cuda/cpu/auto. auto=cuda for GPU reference, cpu for bridge preamble.")
+    p_collect.add_argument("--adapter", default=None, help="Required for --role npu-bridge in formal runs")
+    p_collect.add_argument("--input-root", default=None, help="GPU reference artifact root whose saved inputs should be reused")
+    p_collect.add_argument("--model-id", action="append", default=[])
+    p_collect.add_argument("--model-cache", default="~/.cache/torchbridgebench/models")
+    p_collect.add_argument("--seed", type=int, default=20260624)
+    p_collect.add_argument("--no-pretrained", action="store_true", help="Smoke/debug only; formal runs should use pretrained weights")
+    p_collect.add_argument("--allow-cpu-fallback", action="store_true", help="Allow GPU reference smoke collection without CUDA")
+    p_collect.add_argument("--keep-going", action="store_true")
+    p_collect.set_defaults(func=cmd_collect)
+
+    p_compare = sub.add_parser("compare", help="Compare GPU reference and NPU bridge model artifacts")
+    p_compare.add_argument("--registry", default=default_registry)
+    p_compare.add_argument("--suite", default=default_suite)
+    p_compare.add_argument("--gpu-reference", required=True)
+    p_compare.add_argument("--npu-bridge", required=True)
+    p_compare.add_argument("--out", required=True)
+    p_compare.add_argument("--atol", type=float, default=1e-5)
+    p_compare.add_argument("--rtol", type=float, default=1e-5)
+    p_compare.add_argument("--cosine-threshold", type=float, default=0.999)
+    p_compare.set_defaults(func=cmd_compare)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

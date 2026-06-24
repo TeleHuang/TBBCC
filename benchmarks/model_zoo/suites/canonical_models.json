@@ -1,0 +1,22 @@
+{
+  "schema_version": "tbbcc.model_suite.v1",
+  "suite_id": "canonical_models_v1",
+  "description": "Focused small-model suite for GPU-vs-NPU numerical characterization and paper case-study figures.",
+  "registry": "../registry.json",
+  "model_ids": [
+    "resnet18_imagenet_224",
+    "mobilenetv2_imagenet_224",
+    "vit_tiny_imagenet_224",
+    "unet_small_biosample_256"
+  ],
+  "experiment_modes": [
+    "inference_layerwise",
+    "post_training_short"
+  ],
+  "primary_figures": [
+    "layerwise_fne_curve",
+    "first_divergence_layer",
+    "gradient_consistency_curve",
+    "loss_curve_dtw"
+  ]
+}

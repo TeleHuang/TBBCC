@@ -141,3 +141,34 @@ def test_benchmark_assets_do_not_regress() -> None:
     for filename, count in expected_counts.items():
         suite = json.loads((suites / filename).read_text(encoding="utf-8"))
         assert len(suite.get("cases") or []) == count, filename
+
+
+def test_canonical_model_suite_registry_is_fixed() -> None:
+    registry_path = ROOT / "benchmarks" / "model_zoo" / "registry.json"
+    suite_path = ROOT / "benchmarks" / "model_zoo" / "suites" / "canonical_models.json"
+    assert registry_path.is_file()
+    assert suite_path.is_file()
+
+    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+    suite = json.loads(suite_path.read_text(encoding="utf-8"))
+    assert registry["schema_version"] == "tbbcc.model_zoo.registry.v1"
+    assert suite["schema_version"] == "tbbcc.model_suite.v1"
+
+    expected = {
+        "resnet18_imagenet_224",
+        "mobilenetv2_imagenet_224",
+        "vit_tiny_imagenet_224",
+        "unet_small_biosample_256",
+    }
+    models = {item["model_id"]: item for item in registry["models"]}
+    assert set(models) == expected
+    assert set(suite["model_ids"]) == expected
+    assert len(suite["model_ids"]) == 4
+
+    for model_id, model in models.items():
+        assert model["pretrained_weights"]["source"], model_id
+        assert model["pretrained_weights"]["locator"], model_id
+        assert model["metrics"], model_id
+        assert model["hooks"]["activation_layers"], model_id
+        assert model["hooks"]["gradient_layers"], model_id
+        assert model["figure_role"], model_id

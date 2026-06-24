@@ -187,6 +187,66 @@ local-pair report remains useful for adapter and harness diagnostics, but it
 deletes temporary tensor artifacts and should not be used as the final
 GPU-vs-NPU numerical evidence.
 
+## Canonical Model Suite
+
+The 175-case benchmark is not the main layer-wise numerical evidence. It is the
+broad compatibility, failure-taxonomy and anti-regression suite. Paper-grade
+FNE/GC/TCA figures should use the focused canonical model suite:
+
+```text
+benchmarks/model_zoo/registry.json
+benchmarks/model_zoo/suites/canonical_models.json
+references/canonical-model-experiment-protocol.md
+```
+
+Initial models:
+
+- `resnet18_imagenet_224`
+- `mobilenetv2_imagenet_224`
+- `vit_tiny_imagenet_224`
+- `unet_small_biosample_256`
+
+Validate and inspect the model plan:
+
+```bash
+python scripts/tbbcc_model_suite.py validate
+python scripts/tbbcc_model_suite.py plan --out reports/canonical_model_plan.json
+```
+
+Collect GPU PyTorch reference artifacts on the GPU server:
+
+```bash
+export TBBCC_MODEL_CACHE=/path/to/model_cache
+python scripts/tbbcc_model_suite.py collect \
+  --role gpu-reference \
+  --device cuda \
+  --out reports/canonical_models_gpu
+```
+
+Collect NPU bridge artifacts on the Ascend host using the same saved inputs:
+
+```bash
+source /home/ma-user/work/activate_torch4ms_ms272_cann85.sh
+python scripts/tbbcc_model_suite.py collect \
+  --role npu-bridge \
+  --adapter reports/torch4ms_eval/adapter.generated.json \
+  --input-root reports/canonical_models_gpu \
+  --out reports/canonical_models_torch4ms_npu
+```
+
+Compare artifacts and produce figure-ready source data:
+
+```bash
+python scripts/tbbcc_model_suite.py compare \
+  --gpu-reference reports/canonical_models_gpu \
+  --npu-bridge reports/canonical_models_torch4ms_npu \
+  --out reports/canonical_models_gpu_vs_npu
+```
+
+The comparison summary contains `figure_candidates` and per-model `fne_curve`,
+`gc_curve`, `first_divergence_layer`, output drift and task metrics. Plotting
+scripts should consume this summary instead of re-running model inference.
+
 ## Validation
 
 Validate the plugin manifest and inspect the plugin inventory:
