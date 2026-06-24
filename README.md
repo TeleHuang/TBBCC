@@ -162,6 +162,31 @@ If `mapping_required=true`, the artifact ids do not directly match the suite's
 canonical case ids and must not be used for formal GPU-vs-NPU plots until a
 reviewed mapping file exists.
 
+On the NPU host, collect bridge target artifacts with the same suite and the
+validated bridge adapter:
+
+```bash
+python scripts/tbbcc_bridge_artifacts.py \
+  --suite benchmarks/v1.0.0/suites/all_noop.json \
+  --adapter reports/torch4ms_eval/adapter.generated.json \
+  --out reports/torch4ms_bridge_artifacts
+```
+
+Then compare the GPU reference artifact root with the NPU bridge artifact root:
+
+```bash
+python scripts/tbbcc_compare_artifacts.py \
+  --gpu-reference reports/gpu_reference_all_noop \
+  --npu-bridge reports/torch4ms_bridge_artifacts \
+  --suite benchmarks/v1.0.0/suites/all_noop.json \
+  --out reports/gpu_vs_torch4ms
+```
+
+This comparison is the formal GPU-vs-NPU numeric path. The older `eval-suite`
+local-pair report remains useful for adapter and harness diagnostics, but it
+deletes temporary tensor artifacts and should not be used as the final
+GPU-vs-NPU numerical evidence.
+
 ## Validation
 
 Validate the plugin manifest and inspect the plugin inventory:

@@ -11,6 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import tbbcc  # noqa: E402
+import tbbcc_bridge_artifacts  # noqa: E402
+import tbbcc_compare_artifacts  # noqa: E402
 import tbbcc_gpu_reference  # noqa: E402
 
 
@@ -571,6 +573,86 @@ def test_gpu_reference_collector_uses_canonical_case_id(tmp_path: Path, capsys: 
     assert status_payload["suite_case_count"] == 1
     assert status_payload["direct_overlap_count"] == 1
     assert status_payload["mapping_required"] is False
+
+
+def test_artifact_compare_matches_gpu_and_bridge_outputs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    case = tmp_path / "case.json"
+    suite = tmp_path / "suite.json"
+    adapter = tmp_path / "adapter.json"
+    gpu_out = tmp_path / "gpu_reference"
+    npu_out = tmp_path / "npu_bridge"
+    compare_out = tmp_path / "compare"
+    case.write_text(
+        json.dumps(
+            {
+                "id": "bench_v1.0.0/L1/unit/artifact_compare",
+                "level": "L1",
+                "track": "unit",
+                "seed": 42,
+                "code": "RESULT = {'value': 2.0}\nACTIVATIONS = {'a': 3.0}\nGRADIENTS = {'g': 4.0}",
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(json.dumps({"suite_id": "artifact_compare", "cases": [str(case)], "adapters": []}), encoding="utf-8")
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": "identity",
+                "track": "intercept",
+                "preamble": "",
+                "source_preamble": "",
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class GpuArgs:
+        pass
+
+    GpuArgs.suite = str(suite)
+    GpuArgs.out = str(gpu_out)
+    GpuArgs.device = "cpu"
+    GpuArgs.timeout = 10
+    GpuArgs.no_resume = False
+    GpuArgs.allow_cpu_fallback = False
+    assert tbbcc_gpu_reference.collect_gpu_reference(GpuArgs()) == 0
+    capsys.readouterr()
+
+    class BridgeArgs:
+        pass
+
+    BridgeArgs.suite = str(suite)
+    BridgeArgs.adapter = str(adapter)
+    BridgeArgs.out = str(npu_out)
+    BridgeArgs.timeout = 10
+    BridgeArgs.no_resume = False
+    assert tbbcc_bridge_artifacts.collect_bridge_artifacts(BridgeArgs()) == 0
+    capsys.readouterr()
+
+    class CompareArgs:
+        pass
+
+    CompareArgs.gpu_reference = str(gpu_out)
+    CompareArgs.npu_bridge = str(npu_out)
+    CompareArgs.out = str(compare_out)
+    CompareArgs.suite = str(suite)
+    CompareArgs.atol = 1e-5
+    CompareArgs.rtol = 1e-5
+    assert tbbcc_compare_artifacts.compare_artifacts(CompareArgs()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["totals"]["overlap"] == 1
+    assert payload["totals"]["passed"] == 1
+    summary = json.loads((compare_out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["runs"][0]["case_id"] == "bench_v1.0.0/L1/unit/artifact_compare"
+    assert summary["runs"][0]["channels"]["result"]["passed"] is True
+    assert summary["runs"][0]["channels"]["activations"]["passed"] is True
+    assert summary["runs"][0]["channels"]["gradients"]["passed"] is True
 
 
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:
