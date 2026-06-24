@@ -43,6 +43,8 @@ COMMON = textwrap.dedent(
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def precision_dtype(label, device):
+        if "AMP" in label:
+            return torch.float32
         if "FP16" in label and device.type != "cpu":
             return torch.float16
         return torch.float32
@@ -648,16 +650,16 @@ class UNetSmall(nn.Module):
         self.bottleneck = DoubleConv(channels[1], channels[2], with_bn)
         self.pool = nn.MaxPool2d(2)
         self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if bilinear else nn.ConvTranspose2d(channels[2], channels[1], 2, 2)
-        self.dec2 = DoubleConv(channels[1] * 2, channels[1], with_bn)
+        self.dec2 = DoubleConv((channels[2] + channels[1]) if bilinear else channels[1] * 2, channels[1], with_bn)
         self.up1 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if bilinear else nn.ConvTranspose2d(channels[1], channels[0], 2, 2)
-        self.dec1 = DoubleConv(channels[0] * 2, channels[0], with_bn)
+        self.dec1 = DoubleConv((channels[1] + channels[0]) if bilinear else channels[0] * 2, channels[0], with_bn)
         if depth == 3:
             self.enc3 = DoubleConv(channels[1], channels[2], with_bn)
             self.bottleneck = DoubleConv(channels[2], channels[3], with_bn)
             self.up3 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if bilinear else nn.ConvTranspose2d(channels[3], channels[2], 2, 2)
-            self.dec3 = DoubleConv(channels[2] * 2, channels[2], with_bn)
+            self.dec3 = DoubleConv((channels[3] + channels[2]) if bilinear else channels[2] * 2, channels[2], with_bn)
             self.up2 = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False) if bilinear else nn.ConvTranspose2d(channels[2], channels[1], 2, 2)
-            self.dec2 = DoubleConv(channels[1] * 2, channels[1], with_bn)
+            self.dec2 = DoubleConv((channels[2] + channels[1]) if bilinear else channels[1] * 2, channels[1], with_bn)
         self.out = nn.Conv2d(channels[0], out_ch, 1)
         self.debug = {}
 
@@ -1380,7 +1382,7 @@ criterion = nn.MSELoss()
     elif family == "yolo":
         batch_code = """
 x = torch.randn(batch_size, 3, 320, 320, device=device, dtype=dtype)
-y = torch.randn(batch_size, 24, 20, 20, device=device, dtype=dtype)
+y = torch.randn(batch_size, 24, 10, 10, device=device, dtype=dtype)
 criterion = nn.MSELoss()
 """
         target_expr = "criterion(out, y)"
