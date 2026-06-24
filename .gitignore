@@ -3,3 +3,9 @@ artifacts/
 __pycache__/
 *.pyc
 .pytest_cache/
+.claude/
+.claude-*/
+kernel_meta/
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
