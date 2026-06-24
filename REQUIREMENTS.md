@@ -52,6 +52,31 @@ case id 与 CC benchmark case id 不一致，系统必须显式报告 mapping �
 列为“需修复测评系统/adapter/harness 后重测”，不能标记为 bridge-internal
 MARK_UNFIXABLE。
 
+### P0-0b Canonical Model Suite 是数值比较主线
+
+175-case benchmark 用于覆盖率审计、失败分类和防退化，不应把所有 case 平权地
+作为 GPU-vs-NPU 数值结论来源。正式数值比较必须以少量典型小模型为核心：
+
+- `resnet18_imagenet_224`
+- `mobilenetv2_imagenet_224`
+- `vit_tiny_imagenet_224`
+- `unet_small_biosample_256`
+
+这些模型定义在 `benchmarks/model_zoo/registry.json`，suite 定义在
+`benchmarks/model_zoo/suites/canonical_models.json`。权重和探针数据不进入 Git；
+必须通过 README 记录下载位置、版本、checksum、license、预处理流程和缓存路径。
+
+Canonical Model Suite 的验收要求：
+
+- GPU 与 NPU 运行必须共享同一 checkpoint hash 和同一输入 artifact。
+- 每个模型必须定义 named activation hooks 与 gradient hooks。
+- 推理侧至少报告 final output drift、layer-wise FNE、first divergence layer、
+  latency、throughput、peak memory 和任务指标漂移。
+- 后训练侧至少报告 layer-wise GC、loss curve DTW、最终任务指标偏差，以及
+  optimizer/AMP/BatchNorm/Dropout 的路径差异说明。
+- 论文主图优先来自 Canonical Model Suite；175-case benchmark 主要用于 coverage
+  与 failure taxonomy 图。
+
 ### P0-1 删除 legacy slash command 入口
 
 本项目只保留现代 skill 入口。删除 `commands/`，避免出现全局 `/eval`
@@ -154,6 +179,8 @@ smoke/dev 时，必须默认选择 full benchmark。系统默认复用已验证�
 8. 原版 torchbridgebench 41-case torch4ms 报告必须作为 anti-regression fixture
    被测试固定：总数 41，全部 compatibility/correctness 通过，并且包含 autograd、
    model、module、operator、end2end、repo_training_regression 层级。
+9. Canonical Model Suite 注册表必须包含 4 个初始模型、外部权重策略、hook
+   定义、指标列表和 figure role；测试必须固定这些字段，防止论文主数值资产退化。
 
 ## P1 插件合规要求
 

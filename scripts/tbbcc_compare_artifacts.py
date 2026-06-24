@@ -24,6 +24,13 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def _case_map(root: Path, filename: str) -> dict[str, Path]:
     manifest = _load_json(root / "manifest.json")
     cases = manifest.get("cases") or []
@@ -34,8 +41,14 @@ def _case_map(root: Path, filename: str) -> dict[str, Path]:
         case_id = str(item["case_id"])
         explicit = item.get("reference_json") if filename == "reference.json" else item.get("target_json")
         path = Path(str(explicit)) if explicit else root / "cases" / _case_slug(case_id) / filename
-        if not path.is_absolute():
+        fallback = (root / "cases" / _case_slug(case_id) / filename).resolve()
+        if path.is_absolute():
+            if not _exists(path):
+                path = fallback
+        else:
             path = (root / path).resolve()
+            if not _exists(path):
+                path = fallback
         mapping[case_id] = path
     return mapping
 
@@ -79,16 +92,22 @@ def _channel_compare(gpu_case: dict[str, Any], npu_case: dict[str, Any], gpu_roo
     return {"implemented": True, "passed": bool(metrics.get("passed")), "metrics": metrics}
 
 
-def _case_tolerances(suite_path: Path | None) -> dict[str, tuple[float, float]]:
+def _case_metadata(suite_path: Path | None) -> dict[str, dict[str, Any]]:
     if suite_path is None:
         return {}
     suite = _load_json(suite_path)
     cases = suite.get("cases") or []
-    out: dict[str, tuple[float, float]] = {}
+    out: dict[str, dict[str, Any]] = {}
     for item in cases:
         case_path = tbbcc._resolve_path(suite_path.parent, str(item))
         case = tbbcc.load_case(case_path)
-        out[case.id] = (float(case.ground_truth.get("atol", 1e-5)), float(case.ground_truth.get("rtol", 1e-5)))
+        code = case.code
+        out[case.id] = {
+            "atol": float(case.ground_truth.get("atol", 1e-5)),
+            "rtol": float(case.ground_truth.get("rtol", 1e-5)),
+            "uses_rng": any(token in code for token in ("torch.randn", "torch.rand(", "torch.randint", "torch.normal")),
+            "case_path": str(case_path),
+        }
     return out
 
 
@@ -101,7 +120,7 @@ def compare_artifacts(args: argparse.Namespace) -> int:
 
     gpu_cases = _case_map(gpu_root, "reference.json")
     npu_cases = _case_map(npu_root, "target.json")
-    tolerances = _case_tolerances(suite_path)
+    case_metadata = _case_metadata(suite_path)
     common_ids = sorted(set(gpu_cases) & set(npu_cases))
     missing_gpu = sorted(set(npu_cases) - set(gpu_cases))
     missing_npu = sorted(set(gpu_cases) - set(npu_cases))
@@ -110,7 +129,9 @@ def compare_artifacts(args: argparse.Namespace) -> int:
     for case_id in common_ids:
         gpu_case = _load_json(gpu_cases[case_id])
         npu_case = _load_json(npu_cases[case_id])
-        atol, rtol = tolerances.get(case_id, (float(args.atol), float(args.rtol)))
+        meta = case_metadata.get(case_id, {})
+        atol = float(meta.get("atol", args.atol))
+        rtol = float(meta.get("rtol", args.rtol))
         hash_match = gpu_case.get("case_sha256") == npu_case.get("case_sha256")
         channels = {
             name: _channel_compare(gpu_case, npu_case, gpu_root, npu_root, name, atol, rtol)
@@ -123,10 +144,30 @@ def compare_artifacts(args: argparse.Namespace) -> int:
             if item.get("implemented") and item.get("passed") is False:
                 first_fail = name
                 break
+        failure_class = None
+        if not passed:
+            if not hash_match:
+                failure_class = "CaseHashMismatch"
+            elif gpu_case.get("status") != "passed":
+                failure_class = "GPUReferenceFailure"
+            elif npu_case.get("status") != "passed":
+                failure_class = "BridgeExecutionFailure"
+            elif meta.get("uses_rng") and first_fail in {"result", "activations", "gradients"}:
+                failure_class = "RNGMismatch"
+            elif first_fail == "gradients":
+                failure_class = "GradientMismatch"
+            elif first_fail == "activations":
+                failure_class = "ActivationMismatch"
+            elif first_fail == "task_metrics":
+                failure_class = "TaskMetricMismatch"
+            else:
+                failure_class = "NumericMismatch"
         runs.append(
             {
                 "case_id": case_id,
                 "passed": passed,
+                "failure_class": failure_class,
+                "uses_rng": bool(meta.get("uses_rng")),
                 "hash_match": hash_match,
                 "gpu_status": gpu_case.get("status"),
                 "npu_status": npu_case.get("status"),
@@ -139,6 +180,11 @@ def compare_artifacts(args: argparse.Namespace) -> int:
 
     passed = sum(1 for item in runs if item["passed"])
     failed = len(runs) - passed
+    failure_classes: dict[str, int] = {}
+    for item in runs:
+        cls = item.get("failure_class")
+        if cls:
+            failure_classes[cls] = failure_classes.get(cls, 0) + 1
     summary = {
         "schema_version": SCHEMA,
         "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
@@ -155,6 +201,7 @@ def compare_artifacts(args: argparse.Namespace) -> int:
             "failed": failed,
             "compatibility_rate": (passed / len(runs)) if runs else None,
         },
+        "failure_classes": failure_classes,
         "missing_gpu_case_ids": missing_gpu[:100],
         "missing_npu_case_ids": missing_npu[:100],
         "runs": runs,

@@ -45,6 +45,8 @@ def _load_existing(path: Path) -> dict[str, Any] | None:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            if data.get("status") != "passed":
+                return None
             data["_resumed"] = True
             return data
     except Exception:
@@ -61,6 +63,7 @@ def _write_case_target(
     out_dir: Path,
     timeout: int,
     resume: bool,
+    worker: tbbcc.PersistentPythonWorker | None = None,
 ) -> dict[str, Any]:
     case = tbbcc.load_case(case_path)
     case_dir = out_dir / "cases" / _case_slug(case.id)
@@ -73,14 +76,17 @@ def _write_case_target(
     case_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = case_dir / "artifacts"
     started = _dt.datetime.now(_dt.UTC)
-    result = tbbcc.execute_python(
-        "npu_bridge",
-        adapter.preamble,
-        case.code,
-        adapter.env,
-        timeout,
-        artifact_dir=artifact_dir,
-    )
+    if worker is None:
+        result = tbbcc.execute_python(
+            "npu_bridge",
+            adapter.preamble,
+            case.code,
+            adapter.env,
+            timeout,
+            artifact_dir=artifact_dir,
+        )
+    else:
+        result = worker.run_case(case.code, artifact_dir)
     finished = _dt.datetime.now(_dt.UTC)
     channels = {
         "result": result.result,
@@ -126,28 +132,53 @@ def collect_bridge_artifacts(args: argparse.Namespace) -> int:
 
     started = _dt.datetime.now(_dt.UTC)
     cases: list[dict[str, Any]] = []
-    for case_path in case_paths:
-        item = _write_case_target(
-            suite_id=suite_id,
-            suite_path=suite_path,
-            case_path=case_path,
-            adapter=adapter,
-            out_dir=out_dir,
-            timeout=int(args.timeout or adapter.timeout_seconds),
-            resume=not bool(args.no_resume),
-        )
-        cases.append(
-            {
-                "case_id": item.get("case_id"),
-                "case_path": item.get("case_path"),
-                "case_sha256": item.get("case_sha256"),
-                "level": item.get("level"),
-                "status": item.get("status"),
-                "duration_seconds": item.get("duration_seconds"),
-                "target_json": str((out_dir / "cases" / _case_slug(str(item.get("case_id"))) / "target.json").resolve()),
-                "resumed_from_cache": bool(item.get("_resumed")),
-            }
-        )
+    worker: tbbcc.PersistentPythonWorker | None = None
+    timeout = int(args.timeout or adapter.timeout_seconds)
+    worker_restart_count = 0
+
+    def _close_worker() -> None:
+        nonlocal worker
+        if worker is not None:
+            worker.close()
+            worker = None
+
+    def _ensure_worker() -> tbbcc.PersistentPythonWorker | None:
+        nonlocal worker, worker_restart_count
+        if bool(getattr(args, "isolated_per_case", False)):
+            return None
+        if worker is None:
+            worker = tbbcc.PersistentPythonWorker("npu_bridge", adapter.preamble, adapter.env, timeout, out_dir / ".worker")
+            worker_restart_count += 1
+        return worker
+
+    try:
+        for case_path in case_paths:
+            item = _write_case_target(
+                    suite_id=suite_id,
+                    suite_path=suite_path,
+                    case_path=case_path,
+                    adapter=adapter,
+                    out_dir=out_dir,
+                    timeout=timeout,
+                    resume=not bool(args.no_resume),
+                    worker=_ensure_worker(),
+                )
+            if item.get("status") != "passed" and not bool(getattr(args, "isolated_per_case", False)):
+                _close_worker()
+            cases.append(
+                {
+                    "case_id": item.get("case_id"),
+                    "case_path": item.get("case_path"),
+                    "case_sha256": item.get("case_sha256"),
+                    "level": item.get("level"),
+                    "status": item.get("status"),
+                    "duration_seconds": item.get("duration_seconds"),
+                    "target_json": str((out_dir / "cases" / _case_slug(str(item.get("case_id"))) / "target.json").resolve()),
+                    "resumed_from_cache": bool(item.get("_resumed")),
+                }
+            )
+    finally:
+        _close_worker()
 
     passed = sum(1 for item in cases if item.get("status") == "passed")
     failed = sum(1 for item in cases if item.get("status") == "failed")
@@ -162,6 +193,8 @@ def collect_bridge_artifacts(args: argparse.Namespace) -> int:
         "bridge_id": adapter.bridge_id,
         "adapter_path": str(adapter_path),
         "environment": _environment(adapter.bridge_id),
+        "worker_mode": "isolated_per_case" if bool(getattr(args, "isolated_per_case", False)) else "persistent",
+        "worker_restart_count": worker_restart_count,
         "totals": {
             "total": len(cases),
             "passed": passed,
@@ -185,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True, help="Output directory for bridge target artifacts")
     parser.add_argument("--timeout", type=int, default=None, help="Per-case timeout override")
     parser.add_argument("--no-resume", action="store_true", help="Re-run cases even when target.json already exists")
+    parser.add_argument("--isolated-per-case", action="store_true", help="Debug mode: start a fresh interpreter for every case")
     return parser
 
 
