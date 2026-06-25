@@ -218,11 +218,13 @@ Mixed 30-minute numerical-alignment suite:
 
 - suite: `benchmarks/model_zoo/suites/mixed_alignment_30min.json`
 - models: `resnet18_imagenet_224`, `mobilenetv2_imagenet_224`,
-  `qwen3_35b_a3b_fp16_seq128`, `ddpm_cifar10_unet_32`
-- NPU target: 2 Ascend 910B devices, FP16 inference for Qwen, 1800-second
+  `minimind3o_moe_seq128`, `ddpm_cifar10_unet_32`
+- NPU target: 2 Ascend 910B devices, FP16 inference for MiniMind3o MoE, 1800-second
   NPU-side collection budget.
-- Qwen is inference-only: logits and selected hidden states are compared; full
+- MiniMind3o MoE is inference-only: logits and selected hidden states are compared; full
   gradient capture is intentionally disabled.
+- If the Hugging Face download path is unreliable, pre-download
+  `jingyaogong/minimind-3o-moe` and set `TBBCC_LM_LOCATOR=/path/to/minimind-3o-moe`.
 
 Validate and inspect the model plan:
 

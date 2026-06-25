@@ -318,13 +318,13 @@ def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) ->
 
         locator = str(checkpoint["locator"])
         return AutoModel.from_pretrained(locator) if pretrained else AutoModel.from_config(_bert_tiny_config()), checkpoint
-    if model_id == "qwen3_35b_a3b_fp16_seq128":
+    if model_id == "minimind3o_moe_seq128":
         import torch  # type: ignore
         from transformers import AutoModelForCausalLM  # type: ignore
 
-        locator = os.environ.get("TBBCC_QWEN_LOCATOR", str(checkpoint["locator"]))
+        locator = os.environ.get("TBBCC_LM_LOCATOR", str(checkpoint["locator"]))
         if not pretrained:
-            raise SystemExit("qwen3_35b_a3b_fp16_seq128 requires pretrained weights or a local checkpoint path.")
+            raise SystemExit("minimind3o_moe_seq128 requires pretrained weights or a local checkpoint path.")
         load_kwargs = {
             "torch_dtype": torch.float16,
             "device_map": os.environ.get("TBBCC_LLM_DEVICE_MAP", "auto"),

@@ -177,7 +177,7 @@ def test_canonical_model_suite_registry_is_fixed() -> None:
     mixed_expected = {
         "resnet18_imagenet_224",
         "mobilenetv2_imagenet_224",
-        "qwen3_35b_a3b_fp16_seq128",
+        "minimind3o_moe_seq128",
         "ddpm_cifar10_unet_32",
     }
     models = {item["model_id"]: item for item in registry["models"]}

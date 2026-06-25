@@ -39,11 +39,11 @@ The mixed 30-minute suite is available at
 | --- | --- | --- |
 | `resnet18_imagenet_224` | ResNet-18 | Vision CNN |
 | `mobilenetv2_imagenet_224` | MobileNetV2 | Lightweight vision CNN |
-| `qwen3_35b_a3b_fp16_seq128` | Qwen-3.6-35B-A3B FP16 | Large language model, inference-only |
+| `minimind3o_moe_seq128` | MiniMind-3o-MoE FP16 | Small MoE language model, inference-only |
 | `ddpm_cifar10_unet_32` | DDPM CIFAR-10 UNet 32 | Small diffusion denoising model |
 
-Qwen is intended for two Ascend 910B devices and does not collect gradients.
-The runner compares logits and selected hidden states only.
+MiniMind-3o-MoE is intended for two Ascend 910B devices and does not
+collect gradients. The runner compares logits and selected hidden states only.
 
 ## Weight Storage
 
@@ -64,8 +64,9 @@ Recommended sources:
 - ShuffleNetV2 x1.0: `torchvision.models.ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1`
 - EfficientNet-B0: `torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1`
 - VGG11-BN: `torchvision.models.VGG11_BN_Weights.IMAGENET1K_V1`
-- Qwen-3.6-35B-A3B: set the registry locator to the local checkpoint path or
-  prepare the Hugging Face cache for `Qwen/Qwen3-35B-A3B`.
+- MiniMind-3o-MoE: prepare the Hugging Face cache for
+  `jingyaogong/minimind-3o-moe`, or point `TBBCC_LM_LOCATOR` at a local
+  checkpoint directory.
 - DDPM CIFAR-10 UNet 32: `diffusers.UNet2DModel.from_pretrained("google/ddpm-cifar10-32")`
 
 The current runner looks for the UNet checkpoint at:

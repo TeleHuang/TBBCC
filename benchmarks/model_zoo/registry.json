@@ -205,8 +205,8 @@
       "figure_role": "plain_cnn_depth_candidate"
     },
     {
-      "model_id": "qwen3_35b_a3b_fp16_seq128",
-      "display_name": "Qwen-3.6-35B-A3B FP16",
+      "model_id": "minimind3o_moe_seq128",
+      "display_name": "MiniMind-3o-MoE FP16",
       "task": "causal_language_modeling",
       "architecture_family": "moe_transformer_decoder",
       "input_kind": "language_tokens",
@@ -216,11 +216,11 @@
       "device_map_managed": true,
       "collect_gradients": false,
       "capture_model_outputs": true,
-      "hidden_state_indices": [0, 12, 24, -1],
+      "hidden_state_indices": [0, 1, -1],
       "pretrained_weights": {
         "source": "huggingface_or_local",
-        "locator": "Qwen/Qwen3-35B-A3B",
-        "download_note": "Use a local checkpoint path or Hugging Face cache. Formal NPU runs expect two Ascend 910B devices and FP16 inference."
+        "locator": "jingyaogong/minimind-3o-moe",
+        "download_note": "Use a local checkpoint path or Hugging Face cache for jingyaogong/minimind-3o-moe. Formal NPU runs use two Ascend 910B devices and FP16 inference."
       },
       "dataset_probe": {
         "name": "deterministic short token probe",
@@ -229,11 +229,11 @@
       },
       "metrics": ["logits_cosine", "logits_mae", "selected_hidden_state_fne", "latency_ms", "throughput_img_s", "peak_memory_mb"],
       "hooks": {
-        "activation_layers": ["model.embed_tokens", "model.layers.0", "model.layers.12", "model.layers.24", "model.norm", "lm_head"],
+        "activation_layers": ["model.embed_tokens", "model.layers.0", "model.norm", "lm_head"],
         "gradient_layers": ["model.embed_tokens"]
       },
-      "torch4ms_status": "large_model_candidate",
-      "figure_role": "large_language_model_case"
+      "torch4ms_status": "language_model_candidate",
+      "figure_role": "language_moe_case"
     },
     {
       "model_id": "ddpm_cifar10_unet_32",

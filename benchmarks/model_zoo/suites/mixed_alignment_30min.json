@@ -6,7 +6,7 @@
   "model_ids": [
     "resnet18_imagenet_224",
     "mobilenetv2_imagenet_224",
-    "qwen3_35b_a3b_fp16_seq128",
+    "minimind3o_moe_seq128",
     "ddpm_cifar10_unet_32"
   ],
   "experiment_modes": [
