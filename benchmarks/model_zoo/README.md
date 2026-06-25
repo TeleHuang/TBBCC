@@ -157,12 +157,27 @@ python scripts/tbbcc_model_suite.py collect \
   --role npu-bridge \
   --adapter reports/torch4ms_eval/adapter.generated.json \
   --input-root reports/canonical_models_gpu \
+  --time-budget-seconds 1800 \
   --out reports/canonical_models_torch4ms_npu
 ```
 
 NPU collection skips models missing from `--input-root` by default. Use
 `--strict-input-root` when a complete suite is required and missing GPU inputs
 should fail the run.
+
+The NPU-side numerical-alignment stage should stay within 30 minutes:
+
+```bash
+python scripts/tbbcc_model_suite.py collect \
+  --role npu-bridge \
+  --adapter reports/torch4ms_eval/adapter.generated.json \
+  --input-root reports/canonical_models_gpu \
+  --time-budget-seconds 1800 \
+  --max-models 4 \
+  --out reports/canonical_models_torch4ms_npu
+```
+
+GPU reference collection is outside this budget.
 
 Comparison:
 

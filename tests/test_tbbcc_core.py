@@ -811,6 +811,35 @@ def test_canonical_model_suite_compare_skips_missing_models(tmp_path: Path, caps
     assert len(summary["models"]) == 3
 
 
+def test_model_suite_collect_can_skip_by_max_models(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    class Args:
+        pass
+
+    Args.registry = str(ROOT / "benchmarks" / "model_zoo" / "registry.json")
+    Args.suite = str(ROOT / "benchmarks" / "model_zoo" / "suites" / "canonical_models.json")
+    Args.out = str(tmp_path / "model_collect")
+    Args.role = "gpu-reference"
+    Args.device = "cpu"
+    Args.adapter = None
+    Args.input_root = None
+    Args.strict_input_root = False
+    Args.model_id = []
+    Args.model_cache = str(tmp_path / "model_cache")
+    Args.seed = 1
+    Args.time_budget_seconds = None
+    Args.max_models = 0
+    Args.no_pretrained = True
+    Args.allow_cpu_fallback = True
+    Args.keep_going = False
+
+    assert tbbcc_model_suite.cmd_collect(Args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["totals"]["passed"] == 0
+    assert payload["totals"]["skipped"] == 4
+    manifest = json.loads((tmp_path / "model_collect" / "manifest.json").read_text(encoding="utf-8"))
+    assert {item["reason"] for item in manifest["cases"]} == {"MaxModelsReached"}
+
+
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:
     case = tmp_path / "benchmarks" / "case.json"
     suite = tmp_path / "benchmarks" / "suite.json"

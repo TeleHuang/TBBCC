@@ -249,12 +249,17 @@ python scripts/tbbcc_model_suite.py collect \
   --role npu-bridge \
   --adapter reports/torch4ms_eval/adapter.generated.json \
   --input-root reports/canonical_models_gpu \
+  --time-budget-seconds 1800 \
   --out reports/canonical_models_torch4ms_npu
 ```
 
 When `--input-root` is supplied, missing GPU-reference inputs are skipped by
 default and recorded in the manifest. Add `--strict-input-root` to fail fast if
 the suite is incomplete.
+
+For the paper's NPU-side numerical-alignment stage, keep
+`--time-budget-seconds 1800` as the default budget. Use `--max-models` for a
+smaller calibration run before spending the full budget.
 
 Compare artifacts and produce figure-ready source data:
 

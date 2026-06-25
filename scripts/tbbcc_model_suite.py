@@ -400,6 +400,7 @@ def _task_metrics(model: dict[str, Any], output: Any, duration_seconds: float, b
 def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_path: Path, suite_path: Path) -> dict[str, Any]:
     import torch  # type: ignore
 
+    model_started = time.perf_counter()
     role = str(args.role)
     device_name = _resolve_device(role, str(args.device))
     if role == "gpu-reference" and device_name == "cuda" and not torch.cuda.is_available() and not bool(args.allow_cpu_fallback):
@@ -493,6 +494,7 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
         "figure_role": model.get("figure_role"),
         "activation_layers": len(activations),
         "gradient_layers": len(gradients),
+        "duration_seconds": time.perf_counter() - model_started,
     }
 
 
@@ -569,15 +571,50 @@ def cmd_collect(args: argparse.Namespace) -> int:
             kept.append(model)
         selected = kept
     started = _dt.datetime.now(_dt.UTC)
+    budget_seconds = float(args.time_budget_seconds) if args.time_budget_seconds is not None else None
+    max_models = int(args.max_models) if args.max_models is not None else None
+    wall_started = time.perf_counter()
     cases: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
-    for model in selected:
+    for index, model in enumerate(selected):
+        if max_models is not None and len(cases) >= max_models:
+            skipped.extend(
+                {
+                    "model_id": str(item["model_id"]),
+                    "status": "skipped",
+                    "reason": "MaxModelsReached",
+                }
+                for item in selected[index:]
+            )
+            break
+        if budget_seconds is not None and (time.perf_counter() - wall_started) >= budget_seconds:
+            skipped.extend(
+                {
+                    "model_id": str(item["model_id"]),
+                    "status": "skipped",
+                    "reason": "TimeBudgetExceededBeforeStart",
+                    "time_budget_seconds": budget_seconds,
+                }
+                for item in selected[index:]
+            )
+            break
         try:
             cases.append(_run_one_model(args, model, registry_path, suite_path))
         except Exception as exc:
             failures.append({"model_id": model.get("model_id"), "status": "failed", "error": repr(exc)})
             if not bool(args.keep_going):
                 raise
+        if budget_seconds is not None and (time.perf_counter() - wall_started) >= budget_seconds:
+            skipped.extend(
+                {
+                    "model_id": str(item["model_id"]),
+                    "status": "skipped",
+                    "reason": "TimeBudgetExceededAfterModel",
+                    "time_budget_seconds": budget_seconds,
+                }
+                for item in selected[index + 1 :]
+            )
+            break
     manifest = {
         "schema_version": SCHEMA_MANIFEST,
         "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
@@ -590,6 +627,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
             "failed": len(failures),
             "skipped": len(skipped),
             "duration_seconds": (_dt.datetime.now(_dt.UTC) - started).total_seconds(),
+            "time_budget_seconds": budget_seconds,
+            "max_models": max_models,
         },
         "cases": cases + failures + skipped,
     }
@@ -818,6 +857,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--model-id", action="append", default=[])
     p_collect.add_argument("--model-cache", default="~/.cache/torchbridgebench/models")
     p_collect.add_argument("--seed", type=int, default=20260624)
+    p_collect.add_argument(
+        "--time-budget-seconds",
+        type=float,
+        default=None,
+        help="Stop starting new models once the collection stage reaches this wall-clock budget",
+    )
+    p_collect.add_argument("--max-models", type=int, default=None, help="Maximum number of models to execute from the selected suite")
     p_collect.add_argument("--no-pretrained", action="store_true", help="Smoke/debug only; formal runs should use pretrained weights")
     p_collect.add_argument("--allow-cpu-fallback", action="store_true", help="Allow GPU reference smoke collection without CUDA")
     p_collect.add_argument("--keep-going", action="store_true")
