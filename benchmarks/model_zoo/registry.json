@@ -203,6 +203,64 @@
       },
       "torch4ms_status": "candidate",
       "figure_role": "plain_cnn_depth_candidate"
+    },
+    {
+      "model_id": "qwen3_35b_a3b_fp16_seq128",
+      "display_name": "Qwen-3.6-35B-A3B FP16",
+      "task": "causal_language_modeling",
+      "architecture_family": "moe_transformer_decoder",
+      "input_kind": "language_tokens",
+      "sequence_length": 128,
+      "precision_modes": ["fp16"],
+      "device_count": 2,
+      "device_map_managed": true,
+      "collect_gradients": false,
+      "capture_model_outputs": true,
+      "hidden_state_indices": [0, 12, 24, -1],
+      "pretrained_weights": {
+        "source": "huggingface_or_local",
+        "locator": "Qwen/Qwen3-35B-A3B",
+        "download_note": "Use a local checkpoint path or Hugging Face cache. Formal NPU runs expect two Ascend 910B devices and FP16 inference."
+      },
+      "dataset_probe": {
+        "name": "deterministic short token probe",
+        "storage": "generated",
+        "readme_anchor": "language-token-probe"
+      },
+      "metrics": ["logits_cosine", "logits_mae", "selected_hidden_state_fne", "latency_ms", "throughput_img_s", "peak_memory_mb"],
+      "hooks": {
+        "activation_layers": ["model.embed_tokens", "model.layers.0", "model.layers.12", "model.layers.24", "model.norm", "lm_head"],
+        "gradient_layers": ["model.embed_tokens"]
+      },
+      "torch4ms_status": "large_model_candidate",
+      "figure_role": "large_language_model_case"
+    },
+    {
+      "model_id": "ddpm_cifar10_unet_32",
+      "display_name": "DDPM CIFAR-10 UNet 32",
+      "task": "diffusion_denoising",
+      "architecture_family": "diffusion_unet",
+      "input_kind": "diffusion_latent",
+      "input_shape": [1, 3, 32, 32],
+      "diffusion_timestep": 10,
+      "precision_modes": ["fp32"],
+      "pretrained_weights": {
+        "source": "diffusers_or_local",
+        "locator": "google/ddpm-cifar10-32",
+        "download_note": "Use diffusers.UNet2DModel.from_pretrained('google/ddpm-cifar10-32') or a local cached checkpoint."
+      },
+      "dataset_probe": {
+        "name": "deterministic Gaussian latent plus timestep",
+        "storage": "generated",
+        "readme_anchor": "diffusion-latent-probe"
+      },
+      "metrics": ["denoised_sample_cosine", "denoised_sample_mae", "latency_ms", "throughput_img_s", "peak_memory_mb", "fne_curve", "gc_curve"],
+      "hooks": {
+        "activation_layers": ["conv_in", "down_blocks.0", "down_blocks.1", "mid_block", "up_blocks.0", "conv_out"],
+        "gradient_layers": ["conv_in", "conv_out"]
+      },
+      "torch4ms_status": "candidate",
+      "figure_role": "diffusion_unet_case"
     }
   ]
 }

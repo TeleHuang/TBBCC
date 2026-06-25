@@ -214,6 +214,16 @@ Optional torchvision-only candidate suite:
 - purpose: collect an extra batch of real model artifacts without relying on
   Hugging Face/timm downloads.
 
+Mixed 30-minute numerical-alignment suite:
+
+- suite: `benchmarks/model_zoo/suites/mixed_alignment_30min.json`
+- models: `resnet18_imagenet_224`, `mobilenetv2_imagenet_224`,
+  `qwen3_35b_a3b_fp16_seq128`, `ddpm_cifar10_unet_32`
+- NPU target: 2 Ascend 910B devices, FP16 inference for Qwen, 1800-second
+  NPU-side collection budget.
+- Qwen is inference-only: logits and selected hidden states are compared; full
+  gradient capture is intentionally disabled.
+
 Validate and inspect the model plan:
 
 ```bash
@@ -239,6 +249,12 @@ python scripts/tbbcc_model_suite.py collect \
   --role gpu-reference \
   --device cuda \
   --out reports/torchvision_candidates_gpu
+```
+
+Collect the mixed 30-minute suite on the GPU server:
+
+```bash
+bash scripts/run_mixed_alignment_gpu_reference.sh
 ```
 
 Collect NPU bridge artifacts on the Ascend host using the same saved inputs:
@@ -268,6 +284,13 @@ python scripts/tbbcc_model_suite.py compare \
   --gpu-reference reports/canonical_models_gpu \
   --npu-bridge reports/canonical_models_torch4ms_npu \
   --out reports/canonical_models_gpu_vs_npu
+```
+
+For the mixed suite on the NPU host, use:
+
+```bash
+bash scripts/run_mixed_alignment_npu_bridge.sh
+bash scripts/run_mixed_alignment_compare.sh
 ```
 
 The comparison summary contains `figure_candidates` and per-model `fne_curve`,

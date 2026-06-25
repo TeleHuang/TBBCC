@@ -73,6 +73,21 @@ def _input_artifact_path(root: Path, model_id: str) -> Path:
     return root / model_id / "inputs" / "input.npy"
 
 
+def _input_dir(root: Path, model_id: str) -> Path:
+    return root / model_id / "inputs"
+
+
+def _has_input_artifacts(root: Path, model: dict[str, Any]) -> bool:
+    model_id = str(model["model_id"])
+    directory = _input_dir(root, model_id)
+    kind = _model_input_kind(model)
+    if kind == "language_tokens":
+        return (directory / "input_ids.npy").exists() and (directory / "attention_mask.npy").exists()
+    if kind == "diffusion_latent":
+        return (directory / "sample.npy").exists() and (directory / "timestep.npy").exists()
+    return _input_artifact_path(root, model_id).exists()
+
+
 def _manifest_passed_model_ids(root: Path) -> set[str]:
     manifest_path = root / "manifest.json"
     if not manifest_path.exists():
@@ -86,6 +101,10 @@ def _manifest_passed_model_ids(root: Path) -> set[str]:
         if _artifact_path(root, model_id).exists():
             out.add(model_id)
     return out
+
+
+def _model_input_kind(model: dict[str, Any]) -> str:
+    return str(model.get("input_kind") or "image_tensor")
 
 
 def validate_registry_payload(registry: dict[str, Any], suite: dict[str, Any] | None = None) -> list[str]:
@@ -294,6 +313,35 @@ def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) ->
 
         weights = VGG11_BN_Weights.IMAGENET1K_V1 if pretrained else None
         return vgg11_bn(weights=weights).eval(), checkpoint
+    if model_id == "bert_tiny_uncased_seq128":
+        from transformers import AutoModel  # type: ignore
+
+        locator = str(checkpoint["locator"])
+        return AutoModel.from_pretrained(locator) if pretrained else AutoModel.from_config(_bert_tiny_config()), checkpoint
+    if model_id == "qwen3_35b_a3b_fp16_seq128":
+        import torch  # type: ignore
+        from transformers import AutoModelForCausalLM  # type: ignore
+
+        locator = str(checkpoint["locator"])
+        if not pretrained:
+            raise SystemExit("qwen3_35b_a3b_fp16_seq128 requires pretrained weights or a local checkpoint path.")
+        load_kwargs = {
+            "torch_dtype": torch.float16,
+            "device_map": os.environ.get("TBBCC_LLM_DEVICE_MAP", "auto"),
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+        }
+        local_files_only = os.environ.get("TBBCC_HF_LOCAL_FILES_ONLY")
+        if local_files_only is not None:
+            load_kwargs["local_files_only"] = local_files_only not in {"0", "false", "False"}
+        return AutoModelForCausalLM.from_pretrained(locator, **load_kwargs).eval(), checkpoint
+    if model_id == "ddpm_cifar10_unet_32":
+        if pretrained:
+            from diffusers import UNet2DModel  # type: ignore
+
+            locator = str(checkpoint["locator"])
+            return UNet2DModel.from_pretrained(locator).eval(), checkpoint
+        return _build_tiny_ddpm_unet().eval(), checkpoint
     if model_id == "unet_small_biosample_256":
         net = _build_unet_small().eval()
         checkpoint_path = cache_dir / "unet_small_biosample_256" / "checkpoint.pt"
@@ -308,10 +356,100 @@ def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) ->
     raise SystemExit(f"Unsupported model_id: {model_id}")
 
 
+def _bert_tiny_config() -> Any:
+    from transformers import BertConfig  # type: ignore
+
+    return BertConfig(
+        vocab_size=30522,
+        hidden_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=512,
+        max_position_embeddings=512,
+    )
+
+
+def _build_tiny_ddpm_unet() -> Any:
+    from diffusers import UNet2DModel  # type: ignore
+
+    return UNet2DModel(
+        sample_size=32,
+        in_channels=3,
+        out_channels=3,
+        layers_per_block=1,
+        block_out_channels=(32, 64),
+        down_block_types=("DownBlock2D", "AttnDownBlock2D"),
+        up_block_types=("AttnUpBlock2D", "UpBlock2D"),
+    )
+
+
 def _resolve_device(role: str, requested: str) -> str:
     if requested != "auto":
         return requested
     return "cuda" if role == "gpu-reference" else "cpu"
+
+
+def _move_input_to_device(value: Any, device: str) -> Any:
+    if isinstance(value, dict):
+        return {key: _move_input_to_device(item, device) for key, item in value.items()}
+    if hasattr(value, "to"):
+        return value.to(device)
+    return value
+
+
+def _set_input_requires_grad(value: Any) -> None:
+    if isinstance(value, dict):
+        for item in value.values():
+            _set_input_requires_grad(item)
+        return
+    if hasattr(value, "is_floating_point") and value.is_floating_point():
+        value.requires_grad_(True)
+
+
+def _input_batch_size(value: Any) -> int:
+    if isinstance(value, dict):
+        for item in value.values():
+            if hasattr(item, "shape") and len(item.shape) > 0:
+                return int(item.shape[0])
+        return 1
+    if hasattr(value, "shape") and len(value.shape) > 0:
+        return int(value.shape[0])
+    return 1
+
+
+def _forward_model(net: Any, value: Any, model: dict[str, Any]) -> Any:
+    kind = _model_input_kind(model)
+    if kind == "language_tokens":
+        return net(**value, output_hidden_states=True, use_cache=False)
+    if kind == "diffusion_latent":
+        return net(value["sample"], value["timestep"])
+    return net(value)
+
+
+def _extract_output_tensor(output: Any) -> Any:
+    if hasattr(output, "logits") and output.logits is not None:
+        return output.logits
+    if hasattr(output, "sample") and output.sample is not None:
+        return output.sample
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state
+    if isinstance(output, (tuple, list)) and output:
+        return output[0]
+    return output
+
+
+def _extra_activation_channels(output: Any, model: dict[str, Any]) -> dict[str, Any]:
+    if not bool(model.get("capture_model_outputs")):
+        return {}
+    out: dict[str, Any] = {}
+    if hasattr(output, "hidden_states") and output.hidden_states:
+        hidden_states = list(output.hidden_states)
+        indices = model.get("hidden_state_indices") or [0, len(hidden_states) // 2, len(hidden_states) - 1]
+        for index in indices:
+            idx = int(index)
+            if -len(hidden_states) <= idx < len(hidden_states):
+                out[f"hidden_state_{idx}"] = hidden_states[idx]
+    return out
 
 
 def _prepare_input(
@@ -326,23 +464,97 @@ def _prepare_input(
     import torch  # type: ignore
 
     model_id = str(model["model_id"])
+    kind = _model_input_kind(model)
     if input_root is not None:
-        source = input_root / model_id / "inputs" / "input.npy"
+        source_dir = _input_dir(input_root, model_id)
+        if kind == "language_tokens":
+            input_ids = source_dir / "input_ids.npy"
+            attention_mask = source_dir / "attention_mask.npy"
+            for source in (input_ids, attention_mask):
+                if not source.exists():
+                    raise SystemExit(f"Missing shared input artifact for {model_id}: {source}")
+            return (
+                {
+                    "input_ids": torch.from_numpy(np.load(input_ids, allow_pickle=False)).long().to(device),
+                    "attention_mask": torch.from_numpy(np.load(attention_mask, allow_pickle=False)).long().to(device),
+                },
+                {
+                    "source_dir": str(source_dir.resolve()),
+                    "files": {"input_ids": _sha256_file(input_ids), "attention_mask": _sha256_file(attention_mask)},
+                    "shared_input": True,
+                    "input_kind": kind,
+                },
+            )
+        if kind == "diffusion_latent":
+            sample = source_dir / "sample.npy"
+            timestep = source_dir / "timestep.npy"
+            for source in (sample, timestep):
+                if not source.exists():
+                    raise SystemExit(f"Missing shared input artifact for {model_id}: {source}")
+            return (
+                {
+                    "sample": torch.from_numpy(np.load(sample, allow_pickle=False)).float().to(device),
+                    "timestep": torch.from_numpy(np.load(timestep, allow_pickle=False)).long().to(device),
+                },
+                {
+                    "source_dir": str(source_dir.resolve()),
+                    "files": {"sample": _sha256_file(sample), "timestep": _sha256_file(timestep)},
+                    "shared_input": True,
+                    "input_kind": kind,
+                },
+            )
+        source = source_dir / "input.npy"
         if not source.exists():
             raise SystemExit(f"Missing shared input artifact for {model_id}: {source}")
         arr = np.load(source, allow_pickle=False)
-        tensor = torch.from_numpy(arr).to(device)
-        return tensor, {"source": str(source.resolve()), "sha256": _sha256_file(source), "shared_input": True}
+        tensor = torch.from_numpy(arr).float().to(device)
+        return tensor, {"source": str(source.resolve()), "sha256": _sha256_file(source), "shared_input": True, "input_kind": kind}
 
-    shape = [int(x) for x in model.get("input_shape", [1, 3, 224, 224])]
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    tensor_cpu = torch.randn(*shape, generator=generator, dtype=torch.float32)
     input_dir = model_dir / "inputs"
     input_dir.mkdir(parents=True, exist_ok=True)
+    if kind == "language_tokens":
+        seq_len = int(model.get("sequence_length", 128))
+        ids = torch.zeros((1, seq_len), dtype=torch.long)
+        tokens = [101, 2023, 2003, 1037, 3722, 3793, 6251, 2005, 2898, 2224, 1012, 102]
+        ids[0, : min(seq_len, len(tokens))] = torch.tensor(tokens[:seq_len], dtype=torch.long)
+        mask = (ids != 0).long()
+        ids_path = input_dir / "input_ids.npy"
+        mask_path = input_dir / "attention_mask.npy"
+        np.save(ids_path, ids.numpy(), allow_pickle=False)
+        np.save(mask_path, mask.numpy(), allow_pickle=False)
+        return (
+            {"input_ids": ids.to(device), "attention_mask": mask.to(device)},
+            {
+                "source_dir": _artifact_rel(input_dir, model_dir.parent),
+                "files": {"input_ids": _sha256_file(ids_path), "attention_mask": _sha256_file(mask_path)},
+                "shared_input": False,
+                "input_kind": kind,
+            },
+        )
+    if kind == "diffusion_latent":
+        shape = [int(x) for x in model.get("input_shape", [1, 3, 32, 32])]
+        sample_cpu = torch.randn(*shape, generator=generator, dtype=torch.float32)
+        timestep_cpu = torch.tensor([int(model.get("diffusion_timestep", 10))], dtype=torch.long)
+        sample_path = input_dir / "sample.npy"
+        timestep_path = input_dir / "timestep.npy"
+        np.save(sample_path, sample_cpu.numpy(), allow_pickle=False)
+        np.save(timestep_path, timestep_cpu.numpy(), allow_pickle=False)
+        return (
+            {"sample": sample_cpu.to(device), "timestep": timestep_cpu.to(device)},
+            {
+                "source_dir": _artifact_rel(input_dir, model_dir.parent),
+                "files": {"sample": _sha256_file(sample_path), "timestep": _sha256_file(timestep_path)},
+                "shared_input": False,
+                "input_kind": kind,
+            },
+        )
+    shape = [int(x) for x in model.get("input_shape", [1, 3, 224, 224])]
+    tensor_cpu = torch.randn(*shape, generator=generator, dtype=torch.float32)
     path = input_dir / "input.npy"
     np.save(path, tensor_cpu.numpy(), allow_pickle=False)
-    return tensor_cpu.to(device), {"source": _artifact_rel(path, model_dir.parent), "sha256": _sha256_file(path), "shared_input": False}
+    return tensor_cpu.to(device), {"source": _artifact_rel(path, model_dir.parent), "sha256": _sha256_file(path), "shared_input": False, "input_kind": kind}
 
 
 def _register_activation_hooks(model: Any, layers: list[str], store: dict[str, Any]) -> list[Any]:
@@ -424,7 +636,8 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
     model_dir.mkdir(parents=True, exist_ok=True)
     net, checkpoint = _build_model(model, pretrained=not bool(args.no_pretrained), cache_dir=cache_dir)
     device = torch.device(device_name)
-    net.to(device)
+    if not bool(model.get("device_map_managed")):
+        net.to(device)
     x, input_meta = _prepare_input(
         model,
         model_dir=model_dir,
@@ -432,18 +645,23 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
         device=device_name,
         seed=int(args.seed),
     )
-    x.requires_grad_(True)
+    collect_gradients = bool(model.get("collect_gradients", True))
+    if collect_gradients:
+        _set_input_requires_grad(x)
     activations_raw: dict[str, Any] = {}
     gradients_raw: dict[str, Any] = {}
     handles = []
     hooks = model.get("hooks") or {}
     handles.extend(_register_activation_hooks(net, [str(x) for x in hooks.get("activation_layers", [])], activations_raw))
-    handles.extend(_register_gradient_hooks(net, [str(x) for x in hooks.get("gradient_layers", [])], gradients_raw))
+    if collect_gradients:
+        handles.extend(_register_gradient_hooks(net, [str(x) for x in hooks.get("gradient_layers", [])], gradients_raw))
     started = time.perf_counter()
-    with torch.set_grad_enabled(True):
-        output = net(x)
+    with torch.set_grad_enabled(collect_gradients):
+        output_obj = _forward_model(net, x, model)
+        output = _extract_output_tensor(output_obj)
         loss = output.float().mean()
-        loss.backward()
+        if collect_gradients:
+            loss.backward()
     if device.type == "cuda":
         torch.cuda.synchronize()
     duration = time.perf_counter() - started
@@ -452,14 +670,14 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
 
     activations = {
         name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "activations", out_dir, f"activation_{name}")
-        for name, value in activations_raw.items()
+        for name, value in {**activations_raw, **_extra_activation_channels(output_obj, model)}.items()
     }
     gradients = {
         name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "gradients", out_dir, f"gradient_{name}")
         for name, value in gradients_raw.items()
     }
     result = _summarize_tensor(output, artifact_dir / "result", out_dir, "output")
-    metrics = _task_metrics(model, output, duration, int(x.shape[0]))
+    metrics = _task_metrics(model, output, duration, _input_batch_size(x))
     if device.type == "cuda":
         metrics["peak_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
     else:
@@ -558,13 +776,13 @@ def cmd_collect(args: argparse.Namespace) -> int:
         for model in selected:
             model_id = str(model["model_id"])
             input_path = _input_artifact_path(input_root, model_id)
-            if (passed_ids and model_id not in passed_ids) or not input_path.exists():
+            if (passed_ids and model_id not in passed_ids) or not _has_input_artifacts(input_root, model):
                 skipped.append(
                     {
                         "model_id": model_id,
                         "status": "skipped",
                         "reason": "MissingGPUReferenceInput",
-                        "input_artifact": str(input_path),
+                        "input_artifact": str(_input_dir(input_root, model_id)),
                     }
                 )
                 continue

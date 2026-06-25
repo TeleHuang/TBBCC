@@ -32,6 +32,19 @@ torchvision weight locators to reduce Hugging Face download failures:
 | `efficientnet_b0_imagenet_224` | EfficientNet-B0 | MBConv/SE candidate |
 | `vgg11_bn_imagenet_224` | VGG11-BN | Plain deep CNN candidate |
 
+The mixed 30-minute suite is available at
+`benchmarks/model_zoo/suites/mixed_alignment_30min.json`:
+
+| model_id | Model | Role |
+| --- | --- | --- |
+| `resnet18_imagenet_224` | ResNet-18 | Vision CNN |
+| `mobilenetv2_imagenet_224` | MobileNetV2 | Lightweight vision CNN |
+| `qwen3_35b_a3b_fp16_seq128` | Qwen-3.6-35B-A3B FP16 | Large language model, inference-only |
+| `ddpm_cifar10_unet_32` | DDPM CIFAR-10 UNet 32 | Small diffusion denoising model |
+
+Qwen is intended for two Ascend 910B devices and does not collect gradients.
+The runner compares logits and selected hidden states only.
+
 ## Weight Storage
 
 Weights are not stored in this repository. Set:
@@ -51,6 +64,9 @@ Recommended sources:
 - ShuffleNetV2 x1.0: `torchvision.models.ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1`
 - EfficientNet-B0: `torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1`
 - VGG11-BN: `torchvision.models.VGG11_BN_Weights.IMAGENET1K_V1`
+- Qwen-3.6-35B-A3B: set the registry locator to the local checkpoint path or
+  prepare the Hugging Face cache for `Qwen/Qwen3-35B-A3B`.
+- DDPM CIFAR-10 UNet 32: `diffusers.UNet2DModel.from_pretrained("google/ddpm-cifar10-32")`
 
 The current runner looks for the UNet checkpoint at:
 
@@ -150,6 +166,12 @@ python scripts/tbbcc_model_suite.py collect \
   --out reports/torchvision_candidates_gpu
 ```
 
+Mixed-suite GPU reference collection:
+
+```bash
+bash scripts/run_mixed_alignment_gpu_reference.sh
+```
+
 NPU bridge collection with shared GPU inputs:
 
 ```bash
@@ -178,6 +200,13 @@ python scripts/tbbcc_model_suite.py collect \
 ```
 
 GPU reference collection is outside this budget.
+
+Mixed-suite NPU collection and comparison:
+
+```bash
+bash scripts/run_mixed_alignment_npu_bridge.sh
+bash scripts/run_mixed_alignment_compare.sh
+```
 
 Comparison:
 

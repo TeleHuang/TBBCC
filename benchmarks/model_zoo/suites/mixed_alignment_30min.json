@@ -1,0 +1,25 @@
+{
+  "schema_version": "tbbcc.model_suite.v1",
+  "suite_id": "mixed_alignment_30min",
+  "description": "Thirty-minute NPU-side numerical-alignment suite with vision, language and diffusion representatives.",
+  "registry": "../registry.json",
+  "model_ids": [
+    "resnet18_imagenet_224",
+    "mobilenetv2_imagenet_224",
+    "qwen3_35b_a3b_fp16_seq128",
+    "ddpm_cifar10_unet_32"
+  ],
+  "experiment_modes": [
+    "inference_layerwise",
+    "selected_hidden_state",
+    "diffusion_denoising"
+  ],
+  "primary_figures": [
+    "layerwise_fne_curve",
+    "first_divergence_layer",
+    "logits_drift",
+    "diffusion_sample_drift"
+  ],
+  "npu_budget_seconds": 1800,
+  "recommended_npu_devices": 2
+}
