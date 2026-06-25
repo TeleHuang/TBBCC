@@ -322,7 +322,7 @@ def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) ->
         import torch  # type: ignore
         from transformers import AutoModelForCausalLM  # type: ignore
 
-        locator = str(checkpoint["locator"])
+        locator = os.environ.get("TBBCC_QWEN_LOCATOR", str(checkpoint["locator"]))
         if not pretrained:
             raise SystemExit("qwen3_35b_a3b_fp16_seq128 requires pretrained weights or a local checkpoint path.")
         load_kwargs = {
