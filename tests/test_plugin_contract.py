@@ -146,13 +146,17 @@ def test_benchmark_assets_do_not_regress() -> None:
 def test_canonical_model_suite_registry_is_fixed() -> None:
     registry_path = ROOT / "benchmarks" / "model_zoo" / "registry.json"
     suite_path = ROOT / "benchmarks" / "model_zoo" / "suites" / "canonical_models.json"
+    candidate_suite_path = ROOT / "benchmarks" / "model_zoo" / "suites" / "torchvision_candidates_v1.json"
     assert registry_path.is_file()
     assert suite_path.is_file()
+    assert candidate_suite_path.is_file()
 
     registry = json.loads(registry_path.read_text(encoding="utf-8"))
     suite = json.loads(suite_path.read_text(encoding="utf-8"))
+    candidate_suite = json.loads(candidate_suite_path.read_text(encoding="utf-8"))
     assert registry["schema_version"] == "tbbcc.model_zoo.registry.v1"
     assert suite["schema_version"] == "tbbcc.model_suite.v1"
+    assert candidate_suite["schema_version"] == "tbbcc.model_suite.v1"
 
     expected = {
         "resnet18_imagenet_224",
@@ -160,10 +164,18 @@ def test_canonical_model_suite_registry_is_fixed() -> None:
         "vit_tiny_imagenet_224",
         "unet_small_biosample_256",
     }
+    candidate_expected = {
+        "squeezenet1_1_imagenet_224",
+        "shufflenet_v2_x1_0_imagenet_224",
+        "efficientnet_b0_imagenet_224",
+        "vgg11_bn_imagenet_224",
+    }
     models = {item["model_id"]: item for item in registry["models"]}
-    assert set(models) == expected
+    assert set(models) >= expected | candidate_expected
     assert set(suite["model_ids"]) == expected
+    assert set(candidate_suite["model_ids"]) == candidate_expected
     assert len(suite["model_ids"]) == 4
+    assert len(candidate_suite["model_ids"]) == 4
 
     for model_id, model in models.items():
         assert model["pretrained_weights"]["source"], model_id

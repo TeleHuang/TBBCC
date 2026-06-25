@@ -206,6 +206,14 @@ Initial models:
 - `vit_tiny_imagenet_224`
 - `unet_small_biosample_256`
 
+Optional torchvision-only candidate suite:
+
+- suite: `benchmarks/model_zoo/suites/torchvision_candidates_v1.json`
+- models: `squeezenet1_1_imagenet_224`, `shufflenet_v2_x1_0_imagenet_224`,
+  `efficientnet_b0_imagenet_224`, `vgg11_bn_imagenet_224`
+- purpose: collect an extra batch of real model artifacts without relying on
+  Hugging Face/timm downloads.
+
 Validate and inspect the model plan:
 
 ```bash
@@ -223,6 +231,16 @@ python scripts/tbbcc_model_suite.py collect \
   --out reports/canonical_models_gpu
 ```
 
+Collect the optional torchvision-only candidate suite:
+
+```bash
+python scripts/tbbcc_model_suite.py collect \
+  --suite benchmarks/model_zoo/suites/torchvision_candidates_v1.json \
+  --role gpu-reference \
+  --device cuda \
+  --out reports/torchvision_candidates_gpu
+```
+
 Collect NPU bridge artifacts on the Ascend host using the same saved inputs:
 
 ```bash
@@ -233,6 +251,10 @@ python scripts/tbbcc_model_suite.py collect \
   --input-root reports/canonical_models_gpu \
   --out reports/canonical_models_torch4ms_npu
 ```
+
+When `--input-root` is supplied, missing GPU-reference inputs are skipped by
+default and recorded in the manifest. Add `--strict-input-root` to fail fast if
+the suite is incomplete.
 
 Compare artifacts and produce figure-ready source data:
 

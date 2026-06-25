@@ -103,6 +103,106 @@
       },
       "torch4ms_status": "planned_existing_team_adapter",
       "figure_role": "segmentation_training_case"
+    },
+    {
+      "model_id": "squeezenet1_1_imagenet_224",
+      "display_name": "SqueezeNet1_1",
+      "task": "image_classification",
+      "architecture_family": "cnn_fire_module",
+      "input_shape": [1, 3, 224, 224],
+      "precision_modes": ["fp32"],
+      "pretrained_weights": {
+        "source": "torchvision",
+        "locator": "torchvision.models.SqueezeNet1_1_Weights.IMAGENET1K_V1",
+        "download_note": "Downloaded automatically by torchvision into the configured model cache."
+      },
+      "dataset_probe": {
+        "name": "ImageNet-style calibration subset",
+        "storage": "external",
+        "readme_anchor": "imagenet-style-probe"
+      },
+      "metrics": ["top1", "top5", "latency_ms", "throughput_img_s", "peak_memory_mb", "fne_curve", "gc_curve", "first_divergence_layer"],
+      "hooks": {
+        "activation_layers": ["features.0", "features.3", "features.6", "features.9", "features.12", "classifier"],
+        "gradient_layers": ["features.0", "features.3.squeeze", "features.6.squeeze", "features.9.squeeze", "features.12.squeeze", "classifier.1"]
+      },
+      "torch4ms_status": "candidate",
+      "figure_role": "fire_module_candidate"
+    },
+    {
+      "model_id": "shufflenet_v2_x1_0_imagenet_224",
+      "display_name": "ShuffleNetV2 x1.0",
+      "task": "image_classification",
+      "architecture_family": "cnn_channel_shuffle",
+      "input_shape": [1, 3, 224, 224],
+      "precision_modes": ["fp32"],
+      "pretrained_weights": {
+        "source": "torchvision",
+        "locator": "torchvision.models.ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1",
+        "download_note": "Downloaded automatically by torchvision into the configured model cache."
+      },
+      "dataset_probe": {
+        "name": "ImageNet-style calibration subset",
+        "storage": "external",
+        "readme_anchor": "imagenet-style-probe"
+      },
+      "metrics": ["top1", "top5", "latency_ms", "throughput_img_s", "peak_memory_mb", "fne_curve", "gc_curve", "first_divergence_layer"],
+      "hooks": {
+        "activation_layers": ["conv1", "stage2", "stage3", "stage4", "conv5", "fc"],
+        "gradient_layers": ["conv1.0", "stage2.0.branch2.0", "stage3.0.branch2.0", "stage4.0.branch2.0", "conv5.0", "fc"]
+      },
+      "torch4ms_status": "candidate",
+      "figure_role": "channel_shuffle_candidate"
+    },
+    {
+      "model_id": "efficientnet_b0_imagenet_224",
+      "display_name": "EfficientNet-B0",
+      "task": "image_classification",
+      "architecture_family": "cnn_mbconv_se",
+      "input_shape": [1, 3, 224, 224],
+      "precision_modes": ["fp32"],
+      "pretrained_weights": {
+        "source": "torchvision",
+        "locator": "torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1",
+        "download_note": "Downloaded automatically by torchvision into the configured model cache."
+      },
+      "dataset_probe": {
+        "name": "ImageNet-style calibration subset",
+        "storage": "external",
+        "readme_anchor": "imagenet-style-probe"
+      },
+      "metrics": ["top1", "top5", "latency_ms", "throughput_img_s", "peak_memory_mb", "fne_curve", "gc_curve", "first_divergence_layer"],
+      "hooks": {
+        "activation_layers": ["features.0", "features.1", "features.2", "features.4", "features.6", "features.8", "classifier"],
+        "gradient_layers": ["features.0.0", "features.1.0.block.0.0", "features.2.0.block.0.0", "features.4.0.block.0.0", "features.6.0.block.0.0", "classifier.1"]
+      },
+      "torch4ms_status": "candidate",
+      "figure_role": "mbconv_se_candidate"
+    },
+    {
+      "model_id": "vgg11_bn_imagenet_224",
+      "display_name": "VGG11-BN",
+      "task": "image_classification",
+      "architecture_family": "cnn_plain_deep",
+      "input_shape": [1, 3, 224, 224],
+      "precision_modes": ["fp32"],
+      "pretrained_weights": {
+        "source": "torchvision",
+        "locator": "torchvision.models.VGG11_BN_Weights.IMAGENET1K_V1",
+        "download_note": "Downloaded automatically by torchvision into the configured model cache."
+      },
+      "dataset_probe": {
+        "name": "ImageNet-style calibration subset",
+        "storage": "external",
+        "readme_anchor": "imagenet-style-probe"
+      },
+      "metrics": ["top1", "top5", "latency_ms", "throughput_img_s", "peak_memory_mb", "fne_curve", "gc_curve", "first_divergence_layer"],
+      "hooks": {
+        "activation_layers": ["features.0", "features.4", "features.8", "features.15", "features.22", "avgpool", "classifier"],
+        "gradient_layers": ["features.0", "features.4", "features.8", "features.15", "features.22", "classifier.6"]
+      },
+      "torch4ms_status": "candidate",
+      "figure_role": "plain_cnn_depth_candidate"
     }
   ]
 }

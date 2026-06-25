@@ -12,7 +12,6 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
-import math
 import os
 import platform
 import sys
@@ -68,6 +67,25 @@ def _selected_models(registry_path: Path, suite_path: Path) -> list[dict[str, An
     validate_registry_payload(registry, suite)
     models = _model_by_id(registry)
     return [models[str(model_id)] for model_id in suite["model_ids"]]
+
+
+def _input_artifact_path(root: Path, model_id: str) -> Path:
+    return root / model_id / "inputs" / "input.npy"
+
+
+def _manifest_passed_model_ids(root: Path) -> set[str]:
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
+        return set()
+    manifest = _load_json(manifest_path)
+    out: set[str] = set()
+    for item in manifest.get("cases") or []:
+        if not isinstance(item, dict) or item.get("status") != "passed" or not item.get("model_id"):
+            continue
+        model_id = str(item["model_id"])
+        if _artifact_path(root, model_id).exists():
+            out.add(model_id)
+    return out
 
 
 def validate_registry_payload(registry: dict[str, Any], suite: dict[str, Any] | None = None) -> list[str]:
@@ -256,6 +274,26 @@ def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) ->
         import timm  # type: ignore
 
         return timm.create_model("vit_tiny_patch16_224", pretrained=pretrained).eval(), checkpoint
+    if model_id == "squeezenet1_1_imagenet_224":
+        from torchvision.models import SqueezeNet1_1_Weights, squeezenet1_1  # type: ignore
+
+        weights = SqueezeNet1_1_Weights.IMAGENET1K_V1 if pretrained else None
+        return squeezenet1_1(weights=weights).eval(), checkpoint
+    if model_id == "shufflenet_v2_x1_0_imagenet_224":
+        from torchvision.models import ShuffleNet_V2_X1_0_Weights, shufflenet_v2_x1_0  # type: ignore
+
+        weights = ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1 if pretrained else None
+        return shufflenet_v2_x1_0(weights=weights).eval(), checkpoint
+    if model_id == "efficientnet_b0_imagenet_224":
+        from torchvision.models import EfficientNet_B0_Weights, efficientnet_b0  # type: ignore
+
+        weights = EfficientNet_B0_Weights.IMAGENET1K_V1 if pretrained else None
+        return efficientnet_b0(weights=weights).eval(), checkpoint
+    if model_id == "vgg11_bn_imagenet_224":
+        from torchvision.models import VGG11_BN_Weights, vgg11_bn  # type: ignore
+
+        weights = VGG11_BN_Weights.IMAGENET1K_V1 if pretrained else None
+        return vgg11_bn(weights=weights).eval(), checkpoint
     if model_id == "unet_small_biosample_256":
         net = _build_unet_small().eval()
         checkpoint_path = cache_dir / "unet_small_biosample_256" / "checkpoint.pt"
@@ -510,6 +548,26 @@ def cmd_collect(args: argparse.Namespace) -> int:
     requested = set(args.model_id or [])
     if requested:
         selected = [item for item in selected if item["model_id"] in requested]
+    skipped: list[dict[str, Any]] = []
+    if args.input_root and not bool(getattr(args, "strict_input_root", False)):
+        input_root = Path(args.input_root).resolve()
+        passed_ids = _manifest_passed_model_ids(input_root)
+        kept: list[dict[str, Any]] = []
+        for model in selected:
+            model_id = str(model["model_id"])
+            input_path = _input_artifact_path(input_root, model_id)
+            if (passed_ids and model_id not in passed_ids) or not input_path.exists():
+                skipped.append(
+                    {
+                        "model_id": model_id,
+                        "status": "skipped",
+                        "reason": "MissingGPUReferenceInput",
+                        "input_artifact": str(input_path),
+                    }
+                )
+                continue
+            kept.append(model)
+        selected = kept
     started = _dt.datetime.now(_dt.UTC)
     cases: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
@@ -527,12 +585,13 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "registry": str(registry_path),
         "suite": str(suite_path),
         "totals": {
-            "total": len(cases) + len(failures),
+            "total": len(cases) + len(failures) + len(skipped),
             "passed": len(cases),
             "failed": len(failures),
+            "skipped": len(skipped),
             "duration_seconds": (_dt.datetime.now(_dt.UTC) - started).total_seconds(),
         },
-        "cases": cases + failures,
+        "cases": cases + failures + skipped,
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({"manifest_json": str((out_dir / "manifest.json").resolve()), "totals": manifest["totals"]}, indent=2))
@@ -625,10 +684,27 @@ def cmd_compare(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     models = _selected_models(registry_path, suite_path)
     results: list[dict[str, Any]] = []
+    missing_models: list[dict[str, Any]] = []
     for model in models:
         model_id = str(model["model_id"])
-        gpu = _load_json(_artifact_path(gpu_root, model_id))
-        npu = _load_json(_artifact_path(npu_root, model_id))
+        gpu_path = _artifact_path(gpu_root, model_id)
+        npu_path = _artifact_path(npu_root, model_id)
+        if not gpu_path.exists() or not npu_path.exists():
+            missing_models.append(
+                {
+                    "model_id": model_id,
+                    "display_name": model.get("display_name"),
+                    "figure_role": model.get("figure_role"),
+                    "reason": "MissingModelArtifact",
+                    "gpu_artifact_present": gpu_path.exists(),
+                    "npu_artifact_present": npu_path.exists(),
+                    "gpu_artifact": str(gpu_path),
+                    "npu_artifact": str(npu_path),
+                }
+            )
+            continue
+        gpu = _load_json(gpu_path)
+        npu = _load_json(npu_path)
         channels_g = gpu.get("channels") or {}
         channels_n = npu.get("channels") or {}
         output = _numeric_compare(
@@ -694,16 +770,19 @@ def cmd_compare(args: argparse.Namespace) -> int:
         "gpu_reference": str(gpu_root),
         "npu_bridge": str(npu_root),
         "totals": {
+            "expected_models": len(models),
             "models": len(results),
             "passed": sum(1 for item in results if item.get("passed")),
             "failed": sum(1 for item in results if not item.get("passed")),
+            "missing": len(missing_models),
         },
         "figure_candidates": figure_candidates,
+        "missing_models": missing_models,
         "models": results,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
     print(json.dumps({"summary_json": str((out_dir / "summary.json").resolve()), "totals": summary["totals"]}, indent=2))
-    return 0 if summary["totals"]["failed"] == 0 else 1
+    return 0 if results and summary["totals"]["failed"] == 0 else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -731,6 +810,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--device", default="auto", help="cuda/cpu/auto. auto=cuda for GPU reference, cpu for bridge preamble.")
     p_collect.add_argument("--adapter", default=None, help="Required for --role npu-bridge in formal runs")
     p_collect.add_argument("--input-root", default=None, help="GPU reference artifact root whose saved inputs should be reused")
+    p_collect.add_argument(
+        "--strict-input-root",
+        action="store_true",
+        help="Fail if any suite model is missing from --input-root instead of skipping unavailable models",
+    )
     p_collect.add_argument("--model-id", action="append", default=[])
     p_collect.add_argument("--model-cache", default="~/.cache/torchbridgebench/models")
     p_collect.add_argument("--seed", type=int, default=20260624)

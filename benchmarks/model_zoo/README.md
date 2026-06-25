@@ -21,6 +21,17 @@ and for publication-quality case studies:
 | `vit_tiny_imagenet_224` | ViT-Tiny | Attention/Transformer path case |
 | `unet_small_biosample_256` | UNet-Small | Segmentation and training-path case |
 
+An optional second-batch suite is available at
+`benchmarks/model_zoo/suites/torchvision_candidates_v1.json`. It uses only
+torchvision weight locators to reduce Hugging Face download failures:
+
+| model_id | Model | Role |
+| --- | --- | --- |
+| `squeezenet1_1_imagenet_224` | SqueezeNet1_1 | Fire-module CNN candidate |
+| `shufflenet_v2_x1_0_imagenet_224` | ShuffleNetV2 x1.0 | Channel-shuffle candidate |
+| `efficientnet_b0_imagenet_224` | EfficientNet-B0 | MBConv/SE candidate |
+| `vgg11_bn_imagenet_224` | VGG11-BN | Plain deep CNN candidate |
+
 ## Weight Storage
 
 Weights are not stored in this repository. Set:
@@ -36,6 +47,10 @@ Recommended sources:
 - ViT-Tiny: `timm.create_model("vit_tiny_patch16_224", pretrained=True)`
 - UNet-Small: use the team-adapted torch4ms checkpoint or a public small UNet
   checkpoint; record URL, checksum and license before final experiments.
+- SqueezeNet1_1: `torchvision.models.SqueezeNet1_1_Weights.IMAGENET1K_V1`
+- ShuffleNetV2 x1.0: `torchvision.models.ShuffleNet_V2_X1_0_Weights.IMAGENET1K_V1`
+- EfficientNet-B0: `torchvision.models.EfficientNet_B0_Weights.IMAGENET1K_V1`
+- VGG11-BN: `torchvision.models.VGG11_BN_Weights.IMAGENET1K_V1`
 
 The current runner looks for the UNet checkpoint at:
 
@@ -125,6 +140,16 @@ python scripts/tbbcc_model_suite.py collect \
   --out reports/canonical_models_gpu
 ```
 
+Second-batch torchvision candidate collection:
+
+```bash
+python scripts/tbbcc_model_suite.py collect \
+  --suite benchmarks/model_zoo/suites/torchvision_candidates_v1.json \
+  --role gpu-reference \
+  --device cuda \
+  --out reports/torchvision_candidates_gpu
+```
+
 NPU bridge collection with shared GPU inputs:
 
 ```bash
@@ -134,6 +159,10 @@ python scripts/tbbcc_model_suite.py collect \
   --input-root reports/canonical_models_gpu \
   --out reports/canonical_models_torch4ms_npu
 ```
+
+NPU collection skips models missing from `--input-root` by default. Use
+`--strict-input-root` when a complete suite is required and missing GPU inputs
+should fail the run.
 
 Comparison:
 

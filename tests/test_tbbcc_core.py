@@ -736,6 +736,81 @@ def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path
     assert resnet["first_divergence_layer"] == "layer1"
 
 
+def test_canonical_model_suite_compare_skips_missing_models(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    np = pytest.importorskip("numpy")
+    registry = ROOT / "benchmarks" / "model_zoo" / "registry.json"
+    suite = ROOT / "benchmarks" / "model_zoo" / "suites" / "canonical_models.json"
+    models = json.loads(registry.read_text(encoding="utf-8"))["models"]
+    gpu_root = tmp_path / "gpu_models"
+    npu_root = tmp_path / "npu_models"
+    out = tmp_path / "compare"
+    model_by_id = {item["model_id"]: item for item in models}
+
+    def write_tensor(root: Path, model_id: str, channel: str, name: str) -> dict[str, object]:
+        tensor_path = root / model_id / "artifacts" / channel / f"{name}.npy"
+        tensor_path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(tensor_path, np.asarray([1.0], dtype=np.float32), allow_pickle=False)
+        return {
+            "__tbbcc_model_tensor__": True,
+            "shape": [1],
+            "dtype": "float32",
+            "numel": 1,
+            "artifact_path": str(tensor_path.relative_to(root)),
+        }
+
+    def write_artifact(root: Path, model_id: str) -> None:
+        model = model_by_id[model_id]
+        path = root / model_id / "model_artifact.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        artifact = {
+            "schema_version": "tbbcc.model_artifact.v1",
+            "model_id": model_id,
+            "role": "gpu-reference" if root == gpu_root else "npu-bridge",
+            "status": "passed",
+            "channels": {
+                "result": write_tensor(root, model_id, "result", "output"),
+                "activations": {
+                    layer: write_tensor(root, model_id, "activations", f"activation_{layer}")
+                    for layer in model["hooks"]["activation_layers"]
+                },
+                "gradients": {
+                    layer: write_tensor(root, model_id, "gradients", f"gradient_{layer}")
+                    for layer in model["hooks"]["gradient_layers"]
+                },
+                "task_metrics": {},
+            },
+        }
+        path.write_text(json.dumps(artifact), encoding="utf-8")
+
+    for model in models:
+        if model["model_id"] == "vit_tiny_imagenet_224":
+            continue
+        write_artifact(gpu_root, model["model_id"])
+        write_artifact(npu_root, model["model_id"])
+    (gpu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
+    (npu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
+
+    class Args:
+        pass
+
+    Args.registry = str(registry)
+    Args.suite = str(suite)
+    Args.gpu_reference = str(gpu_root)
+    Args.npu_bridge = str(npu_root)
+    Args.out = str(out)
+    Args.atol = 0.0
+    Args.rtol = 0.0
+    Args.cosine_threshold = 0.999
+
+    assert tbbcc_model_suite.cmd_compare(Args()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["totals"]["models"] == 3
+    assert payload["totals"]["missing"] == 1
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["missing_models"][0]["model_id"] == "vit_tiny_imagenet_224"
+    assert len(summary["models"]) == 3
+
+
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:
     case = tmp_path / "benchmarks" / "case.json"
     suite = tmp_path / "benchmarks" / "suite.json"
