@@ -35,6 +35,7 @@ def test_modern_plugin_structure_only() -> None:
 
     expected = {
         "torchbridgebench": "eval",
+        "numeric": "numeric",
         "inspect": "inspect",
         "ar-baseline": "ar-baseline",
     }
@@ -115,6 +116,29 @@ def test_eval_skill_guards_against_backend_adapter_regression() -> None:
         "backend sanity check",
         "device_target",
         "CPU backend diagnostic",
+    ]
+    for phrase in required_phrases:
+        assert phrase in combined
+
+
+def test_numeric_only_skill_is_first_class_plugin_entrypoint() -> None:
+    numeric = ROOT / "skills" / "numeric" / "SKILL.md"
+    eval_skill = ROOT / "skills" / "torchbridgebench" / "SKILL.md"
+    wrapper = ROOT / "scripts" / "run_numeric_compare_only.sh"
+    assert numeric.is_file()
+    assert wrapper.is_file()
+    assert wrapper.stat().st_mode & 0o111
+    assert _frontmatter(numeric)["name"] == "numeric"
+    combined = numeric.read_text(encoding="utf-8") + "\n" + eval_skill.read_text(encoding="utf-8")
+    required_phrases = [
+        "仅数值比对",
+        "numeric-only",
+        "GPU-vs-NPU",
+        "run_numeric_compare_only.sh",
+        "source_data/model_summary.csv",
+        "source_data/layerwise_fne.csv",
+        "do not generate adapter/suite files",
+        "do not run `eval-suite`",
     ]
     for phrase in required_phrases:
         assert phrase in combined

@@ -31,6 +31,18 @@ Inside Claude Code, confirm the plugin is loaded:
 /torchbridgebench:inspect
 ```
 
+Run numeric-only GPU-vs-NPU comparison from already collected model artifacts:
+
+```text
+/torchbridgebench:numeric 仅数值比对，GPU reports/mixed_alignment_gpu，NPU reports/mixed_alignment_torch4ms_npu_20260626，输出到 reports/mixed_alignment_gpu_vs_npu_manual
+```
+
+The same mode is also available through `eval`:
+
+```text
+/torchbridgebench:eval 仅数值比对 mixed alignment，使用已有 GPU/NPU artifact，输出到 reports/mixed_alignment_gpu_vs_npu_manual
+```
+
 Run an end-to-end bridge evaluation with natural language:
 
 ```text
@@ -293,6 +305,15 @@ For the mixed suite on the NPU host, use:
 ```bash
 bash scripts/run_mixed_alignment_npu_bridge.sh
 bash scripts/run_mixed_alignment_compare.sh
+```
+
+Numeric-only comparison can also be run directly without Claude Code:
+
+```bash
+TBBCC_GPU_ROOT=reports/mixed_alignment_gpu \
+TBBCC_NPU_ROOT=reports/mixed_alignment_torch4ms_npu_20260626 \
+TBBCC_COMPARE_OUT=reports/mixed_alignment_gpu_vs_npu_manual \
+bash scripts/run_numeric_compare_only.sh
 ```
 
 The comparison summary contains `figure_candidates` and per-model `fne_curve`,
