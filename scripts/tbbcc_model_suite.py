@@ -618,10 +618,7 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
     if role == "gpu-reference" and device_name == "cuda" and not torch.cuda.is_available() and not bool(args.allow_cpu_fallback):
         raise SystemExit("CUDA is not available. Use --device cpu only for smoke tests.")
 
-    if args.adapter:
-        adapter = tbbcc.load_adapter(Path(args.adapter).resolve())
-        namespace = {"__name__": "__tbbcc_model_bridge_preamble__"}
-        exec(adapter.preamble, namespace, namespace)
+    adapter_path = Path(args.adapter).resolve() if args.adapter else None
 
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -655,65 +652,82 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
     handles.extend(_register_activation_hooks(net, [str(x) for x in hooks.get("activation_layers", [])], activations_raw))
     if collect_gradients:
         handles.extend(_register_gradient_hooks(net, [str(x) for x in hooks.get("gradient_layers", [])], gradients_raw))
-    started = time.perf_counter()
-    with torch.set_grad_enabled(collect_gradients):
-        output_obj = _forward_model(net, x, model)
-        output = _extract_output_tensor(output_obj)
-        loss = output.float().mean()
-        if collect_gradients:
-            loss.backward()
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    duration = time.perf_counter() - started
-    for handle in handles:
-        handle.remove()
 
-    activations = {
-        name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "activations", out_dir, f"activation_{name}")
-        for name, value in {**activations_raw, **_extra_activation_channels(output_obj, model)}.items()
-    }
-    gradients = {
-        name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "gradients", out_dir, f"gradient_{name}")
-        for name, value in gradients_raw.items()
-    }
-    result = _summarize_tensor(output, artifact_dir / "result", out_dir, "output")
-    metrics = _task_metrics(model, output, duration, _input_batch_size(x))
-    if device.type == "cuda":
-        metrics["peak_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
-    else:
-        metrics["peak_memory_mb"] = None
-    metrics["loss_scalar"] = float(loss.detach().float().cpu())
-    artifact = {
-        "schema_version": SCHEMA_ARTIFACT,
-        "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
-        "model_id": model_id,
-        "display_name": model.get("display_name"),
-        "role": role,
-        "status": "passed",
-        "registry_path": str(registry_path),
-        "suite_path": str(suite_path),
-        "environment": _environment(role, device_name),
-        "checkpoint": checkpoint,
-        "input": input_meta,
-        "channels": {
-            "result": result,
-            "activations": activations,
-            "gradients": gradients,
-            "task_metrics": metrics,
-        },
-        "figure_role": model.get("figure_role"),
-    }
-    artifact_path = model_dir / "model_artifact.json"
-    artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
-    return {
-        "model_id": model_id,
-        "status": "passed",
-        "artifact_json": str(artifact_path.resolve()),
-        "figure_role": model.get("figure_role"),
-        "activation_layers": len(activations),
-        "gradient_layers": len(gradients),
-        "duration_seconds": time.perf_counter() - model_started,
-    }
+    bridge_namespace: dict[str, Any] | None = None
+    try:
+        if adapter_path is not None:
+            adapter = tbbcc.load_adapter(adapter_path)
+            bridge_namespace = {"__name__": "__tbbcc_model_bridge_preamble__"}
+            exec(adapter.preamble, bridge_namespace, bridge_namespace)
+            torch.manual_seed(int(args.seed))
+
+        started = time.perf_counter()
+        with torch.set_grad_enabled(collect_gradients):
+            output_obj = _forward_model(net, x, model)
+            output = _extract_output_tensor(output_obj)
+            loss = output.float().mean()
+            if collect_gradients:
+                loss.backward()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        duration = time.perf_counter() - started
+
+        activations = {
+            name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "activations", out_dir, f"activation_{name}")
+            for name, value in {**activations_raw, **_extra_activation_channels(output_obj, model)}.items()
+        }
+        gradients = {
+            name: value if isinstance(value, dict) else _summarize_tensor(value, artifact_dir / "gradients", out_dir, f"gradient_{name}")
+            for name, value in gradients_raw.items()
+        }
+        result = _summarize_tensor(output, artifact_dir / "result", out_dir, "output")
+        metrics = _task_metrics(model, output, duration, _input_batch_size(x))
+        if device.type == "cuda":
+            metrics["peak_memory_mb"] = float(torch.cuda.max_memory_allocated(device) / (1024 * 1024))
+        else:
+            metrics["peak_memory_mb"] = None
+        metrics["loss_scalar"] = float(loss.detach().float().cpu())
+        artifact = {
+            "schema_version": SCHEMA_ARTIFACT,
+            "created_at": _dt.datetime.now(_dt.UTC).isoformat(),
+            "model_id": model_id,
+            "display_name": model.get("display_name"),
+            "role": role,
+            "status": "passed",
+            "registry_path": str(registry_path),
+            "suite_path": str(suite_path),
+            "environment": _environment(role, device_name),
+            "checkpoint": checkpoint,
+            "input": input_meta,
+            "channels": {
+                "result": result,
+                "activations": activations,
+                "gradients": gradients,
+                "task_metrics": metrics,
+            },
+            "figure_role": model.get("figure_role"),
+        }
+        artifact_path = model_dir / "model_artifact.json"
+        artifact_path.write_text(json.dumps(artifact, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+        return {
+            "model_id": model_id,
+            "status": "passed",
+            "artifact_json": str(artifact_path.resolve()),
+            "figure_role": model.get("figure_role"),
+            "activation_layers": len(activations),
+            "gradient_layers": len(gradients),
+            "duration_seconds": time.perf_counter() - model_started,
+        }
+    finally:
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        if bridge_namespace is not None:
+            env = bridge_namespace.get("_env")
+            if hasattr(env, "__exit__"):
+                env.__exit__(None, None, None)
 
 
 def cmd_validate(args: argparse.Namespace) -> int:

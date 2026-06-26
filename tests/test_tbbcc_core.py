@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import sys
 from pathlib import Path
 
@@ -838,6 +839,16 @@ def test_model_suite_collect_can_skip_by_max_models(tmp_path: Path, capsys: pyte
     assert payload["totals"]["skipped"] == 4
     manifest = json.loads((tmp_path / "model_collect" / "manifest.json").read_text(encoding="utf-8"))
     assert {item["reason"] for item in manifest["cases"]} == {"MaxModelsReached"}
+
+
+def test_model_suite_bridge_preamble_runs_after_model_setup() -> None:
+    source = inspect.getsource(tbbcc_model_suite._run_one_model)
+    adapter_exec = source.index("exec(adapter.preamble")
+    assert source.index("_build_model(") < adapter_exec
+    assert source.index("_prepare_input(") < adapter_exec
+    assert source.index("_register_activation_hooks(") < adapter_exec
+    assert source.index("_register_gradient_hooks(") < adapter_exec
+    assert adapter_exec < source.index("_forward_model(")
 
 
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:
