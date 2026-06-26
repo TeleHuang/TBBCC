@@ -296,8 +296,12 @@ bash scripts/run_mixed_alignment_compare.sh
 ```
 
 The comparison summary contains `figure_candidates` and per-model `fne_curve`,
-`gc_curve`, `first_divergence_layer`, output drift and task metrics. Plotting
-scripts should consume this summary instead of re-running model inference.
+`gc_curve`, `first_divergence_layer`, output drift and task metrics. It reports
+both strict `atol`/`rtol` pass/fail and a benchmark-oriented numerical verdict:
+`aligned`, `usable_with_drift`, `outlier_dominated`, `diverged` or
+`unavailable`. The command also writes `source_data/layerwise_fne.csv` and
+`source_data/model_summary.csv` so plotting scripts can consume source data
+without re-running model inference.
 
 ## Validation
 

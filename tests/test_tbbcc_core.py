@@ -711,7 +711,21 @@ def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path
             artifact_path.parent.mkdir(parents=True, exist_ok=True)
             artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
     (gpu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
-    (npu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
+    (npu_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "tbbcc.model_artifact_manifest.v1",
+                "cases": [
+                    {
+                        "model_id": "vit_tiny_imagenet_224",
+                        "status": "failed",
+                        "error": "OperatorNotFound('attention')",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Args:
         pass
@@ -724,6 +738,10 @@ def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path
     Args.atol = 0.0
     Args.rtol = 0.0
     Args.cosine_threshold = 0.999
+    Args.aligned_cosine = 0.9999
+    Args.usable_cosine = 0.99
+    Args.aligned_p95 = 1e-2
+    Args.usable_p95 = 5e-2
 
     assert tbbcc_model_suite.cmd_compare(Args()) == 1
     payload = json.loads(capsys.readouterr().out)
@@ -735,6 +753,9 @@ def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path
     }
     resnet = next(item for item in summary["models"] if item["model_id"] == "resnet18_imagenet_224")
     assert resnet["first_divergence_layer"] == "layer1"
+    assert resnet["numerical_verdict"] == "diverged"
+    assert (out / "source_data" / "layerwise_fne.csv").is_file()
+    assert (out / "source_data" / "model_summary.csv").is_file()
 
 
 def test_canonical_model_suite_compare_skips_missing_models(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -789,7 +810,21 @@ def test_canonical_model_suite_compare_skips_missing_models(tmp_path: Path, caps
         write_artifact(gpu_root, model["model_id"])
         write_artifact(npu_root, model["model_id"])
     (gpu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
-    (npu_root / "manifest.json").write_text(json.dumps({"schema_version": "tbbcc.model_artifact_manifest.v1"}), encoding="utf-8")
+    (npu_root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "tbbcc.model_artifact_manifest.v1",
+                "cases": [
+                    {
+                        "model_id": "vit_tiny_imagenet_224",
+                        "status": "failed",
+                        "error": "OperatorNotFound('attention')",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     class Args:
         pass
@@ -802,6 +837,10 @@ def test_canonical_model_suite_compare_skips_missing_models(tmp_path: Path, caps
     Args.atol = 0.0
     Args.rtol = 0.0
     Args.cosine_threshold = 0.999
+    Args.aligned_cosine = 0.9999
+    Args.usable_cosine = 0.99
+    Args.aligned_p95 = 1e-2
+    Args.usable_p95 = 5e-2
 
     assert tbbcc_model_suite.cmd_compare(Args()) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -809,6 +848,8 @@ def test_canonical_model_suite_compare_skips_missing_models(tmp_path: Path, caps
     assert payload["totals"]["missing"] == 1
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["missing_models"][0]["model_id"] == "vit_tiny_imagenet_224"
+    assert summary["missing_models"][0]["npu_error"] == "OperatorNotFound('attention')"
+    assert summary["benchmark_verdict"] == "usable_partial"
     assert len(summary["models"]) == 3
 
 

@@ -9,6 +9,7 @@ figures and task-level drift analysis.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as _dt
 import hashlib
 import json
@@ -885,6 +886,18 @@ def _load_array(summary: dict[str, Any], root: Path) -> Any:
     return np.load(path, allow_pickle=False)
 
 
+def _manifest_cases_by_model(root: Path) -> dict[str, dict[str, Any]]:
+    manifest_path = root / "manifest.json"
+    if not manifest_path.exists():
+        return {}
+    manifest = _load_json(manifest_path)
+    return {
+        str(item["model_id"]): item
+        for item in manifest.get("cases") or []
+        if isinstance(item, dict) and item.get("model_id")
+    }
+
+
 def _numeric_compare(a: Any, b: Any, atol: float, rtol: float) -> dict[str, Any]:
     import numpy as np  # type: ignore
 
@@ -895,23 +908,57 @@ def _numeric_compare(a: Any, b: Any, atol: float, rtol: float) -> dict[str, Any]
     av = a.reshape(-1).astype("float64", copy=False)
     bv = b.reshape(-1).astype("float64", copy=False)
     diff = np.abs(av - bv)
+    finite_mask = np.isfinite(av) & np.isfinite(bv) & np.isfinite(diff)
+    finite = diff[finite_mask]
     close = diff <= (atol + rtol * np.abs(bv))
     dot = float(np.dot(av, bv))
     norm = float(np.linalg.norm(av) * np.linalg.norm(bv))
     cosine = dot / norm if norm > 0 else None
-    finite = diff[np.isfinite(diff)]
+    ref_scale = float(np.mean(np.abs(av[finite_mask]))) if np.any(finite_mask) else 0.0
+    mae = float(np.mean(finite)) if finite.size else float("inf")
+    p95 = float(np.percentile(finite, 95)) if finite.size else float("inf")
+    p99 = float(np.percentile(finite, 99)) if finite.size else float("inf")
+    outlier_ratio = (float(np.max(finite)) / p95) if finite.size and p95 > 0 else None
     return {
         "passed": bool(np.all(close)),
         "reason": None if bool(np.all(close)) else "NumericMismatch",
         "count": int(av.size),
-        "mae": float(np.mean(finite)) if finite.size else float("inf"),
+        "mae": mae,
+        "relative_mae": (mae / ref_scale) if ref_scale > 0 else None,
         "max_error": float(np.max(diff)) if diff.size else 0.0,
-        "p95": float(np.percentile(finite, 95)) if finite.size else float("inf"),
+        "p50": float(np.percentile(finite, 50)) if finite.size else float("inf"),
+        "p95": p95,
+        "p99": p99,
         "cosine": cosine,
         "failed_count": int(np.size(close) - np.count_nonzero(close)),
+        "finite_count": int(np.count_nonzero(finite_mask)),
+        "nonfinite_count": int(av.size - np.count_nonzero(finite_mask)),
+        "finite_fraction": float(np.count_nonzero(finite_mask) / av.size) if av.size else None,
+        "outlier_ratio_max_to_p95": outlier_ratio,
+        "outlier_dominated": bool(outlier_ratio is not None and outlier_ratio > 1e6),
         "atol": atol,
         "rtol": rtol,
     }
+
+
+def _numeric_quality(metrics: dict[str, Any], *, aligned_cosine: float, usable_cosine: float, aligned_p95: float, usable_p95: float) -> str:
+    if metrics.get("passed") is True:
+        return "strict_pass"
+    if metrics.get("reason") in {"MissingArtifact", "ShapeMismatch", "MissingLayer"}:
+        return "unavailable"
+    if metrics.get("nonfinite_count"):
+        return "invalid_nonfinite"
+    if metrics.get("outlier_dominated"):
+        return "outlier_dominated"
+    cosine = metrics.get("cosine")
+    p95 = metrics.get("p95")
+    if not isinstance(cosine, (int, float)) or not isinstance(p95, (int, float)):
+        return "unknown"
+    if cosine >= aligned_cosine and p95 <= aligned_p95:
+        return "aligned_with_tolerance"
+    if cosine >= usable_cosine and p95 <= usable_p95:
+        return "usable_drift"
+    return "diverged"
 
 
 def _compare_named_channel(
@@ -938,12 +985,146 @@ def _compare_named_channel(
     return rows
 
 
+def _annotate_numeric_rows(
+    rows: list[dict[str, Any]],
+    *,
+    aligned_cosine: float,
+    usable_cosine: float,
+    aligned_p95: float,
+    usable_p95: float,
+) -> list[dict[str, Any]]:
+    return [
+        {
+            **row,
+            "quality": _numeric_quality(
+                row,
+                aligned_cosine=aligned_cosine,
+                usable_cosine=usable_cosine,
+                aligned_p95=aligned_p95,
+                usable_p95=usable_p95,
+            ),
+        }
+        for row in rows
+    ]
+
+
 def _first_divergence(rows: list[dict[str, Any]], threshold: float) -> str | None:
     for row in rows:
         cosine = row.get("cosine")
         if row.get("passed") is False or (isinstance(cosine, (int, float)) and cosine < threshold):
             return str(row.get("name"))
     return None
+
+
+def _first_quality_drop(rows: list[dict[str, Any]], allowed: set[str]) -> str | None:
+    for row in rows:
+        if str(row.get("quality")) not in allowed:
+            return str(row.get("name"))
+    return None
+
+
+def _summarize_quality(rows: list[dict[str, Any]]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for row in rows:
+        quality = str(row.get("quality") or "unknown")
+        out[quality] = out.get(quality, 0) + 1
+    return out
+
+
+def _latency_ratio(gpu_metrics: dict[str, Any], npu_metrics: dict[str, Any]) -> float | None:
+    gpu = gpu_metrics.get("latency_ms")
+    npu = npu_metrics.get("latency_ms")
+    if isinstance(gpu, (int, float)) and isinstance(npu, (int, float)) and gpu > 0:
+        return float(npu / gpu)
+    return None
+
+
+def _write_model_suite_source_data(summary: dict[str, Any], out_dir: Path) -> None:
+    source_dir = out_dir / "source_data"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    fne_path = source_dir / "layerwise_fne.csv"
+    with fne_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "model_id",
+                "layer",
+                "quality",
+                "passed",
+                "cosine",
+                "mae",
+                "relative_mae",
+                "p95",
+                "p99",
+                "max_error",
+                "failed_count",
+                "count",
+                "outlier_dominated",
+            ],
+        )
+        writer.writeheader()
+        for model in summary.get("models") or []:
+            for row in model.get("fne_curve") or []:
+                writer.writerow(
+                    {
+                        "model_id": model.get("model_id"),
+                        "layer": row.get("name"),
+                        "quality": row.get("quality"),
+                        "passed": row.get("passed"),
+                        "cosine": row.get("cosine"),
+                        "mae": row.get("mae"),
+                        "relative_mae": row.get("relative_mae"),
+                        "p95": row.get("p95"),
+                        "p99": row.get("p99"),
+                        "max_error": row.get("max_error"),
+                        "failed_count": row.get("failed_count"),
+                        "count": row.get("count"),
+                        "outlier_dominated": row.get("outlier_dominated"),
+                    }
+                )
+    model_path = source_dir / "model_summary.csv"
+    with model_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "model_id",
+                "status",
+                "numerical_verdict",
+                "output_quality",
+                "first_divergence_layer",
+                "first_quality_drop_layer",
+                "latency_ratio_npu_over_gpu",
+                "npu_error",
+            ],
+        )
+        writer.writeheader()
+        missing = {item["model_id"]: item for item in summary.get("missing_models") or [] if item.get("model_id")}
+        for model in summary.get("models") or []:
+            writer.writerow(
+                {
+                    "model_id": model.get("model_id"),
+                    "status": "compared",
+                    "numerical_verdict": model.get("numerical_verdict"),
+                    "output_quality": (model.get("output_drift") or {}).get("quality"),
+                    "first_divergence_layer": model.get("first_divergence_layer"),
+                    "first_quality_drop_layer": model.get("first_quality_drop_layer"),
+                    "latency_ratio_npu_over_gpu": model.get("latency_ratio_npu_over_gpu"),
+                    "npu_error": "",
+                }
+            )
+        for model_id, item in missing.items():
+            writer.writerow(
+                {
+                    "model_id": model_id,
+                    "status": "missing",
+                    "numerical_verdict": "unavailable",
+                    "output_quality": "",
+                    "first_divergence_layer": "",
+                    "first_quality_drop_layer": "",
+                    "latency_ratio_npu_over_gpu": "",
+                    "npu_error": item.get("npu_error") or item.get("reason"),
+                }
+            )
 
 
 def cmd_compare(args: argparse.Namespace) -> int:
@@ -954,6 +1135,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
     out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     models = _selected_models(registry_path, suite_path)
+    npu_manifest_cases = _manifest_cases_by_model(npu_root)
     results: list[dict[str, Any]] = []
     missing_models: list[dict[str, Any]] = []
     for model in models:
@@ -961,6 +1143,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
         gpu_path = _artifact_path(gpu_root, model_id)
         npu_path = _artifact_path(npu_root, model_id)
         if not gpu_path.exists() or not npu_path.exists():
+            npu_manifest_case = npu_manifest_cases.get(model_id) or {}
             missing_models.append(
                 {
                     "model_id": model_id,
@@ -969,6 +1152,8 @@ def cmd_compare(args: argparse.Namespace) -> int:
                     "reason": "MissingModelArtifact",
                     "gpu_artifact_present": gpu_path.exists(),
                     "npu_artifact_present": npu_path.exists(),
+                    "npu_status": npu_manifest_case.get("status"),
+                    "npu_error": npu_manifest_case.get("error"),
                     "gpu_artifact": str(gpu_path),
                     "npu_artifact": str(npu_path),
                 }
@@ -984,37 +1169,75 @@ def cmd_compare(args: argparse.Namespace) -> int:
             float(args.atol),
             float(args.rtol),
         )
+        output["quality"] = _numeric_quality(
+            output,
+            aligned_cosine=float(args.aligned_cosine),
+            usable_cosine=float(args.usable_cosine),
+            aligned_p95=float(args.aligned_p95),
+            usable_p95=float(args.usable_p95),
+        )
         hooks = model.get("hooks") or {}
-        fne = _compare_named_channel(
-            channels_g.get("activations") or {},
-            channels_n.get("activations") or {},
-            gpu_root,
-            npu_root,
-            float(args.atol),
-            float(args.rtol),
-            [str(item) for item in hooks.get("activation_layers", [])],
+        fne = _annotate_numeric_rows(
+            _compare_named_channel(
+                channels_g.get("activations") or {},
+                channels_n.get("activations") or {},
+                gpu_root,
+                npu_root,
+                float(args.atol),
+                float(args.rtol),
+                [str(item) for item in hooks.get("activation_layers", [])],
+            ),
+            aligned_cosine=float(args.aligned_cosine),
+            usable_cosine=float(args.usable_cosine),
+            aligned_p95=float(args.aligned_p95),
+            usable_p95=float(args.usable_p95),
         )
-        gc = _compare_named_channel(
-            channels_g.get("gradients") or {},
-            channels_n.get("gradients") or {},
-            gpu_root,
-            npu_root,
-            float(args.atol),
-            float(args.rtol),
-            [str(item) for item in hooks.get("gradient_layers", [])],
+        gc = _annotate_numeric_rows(
+            _compare_named_channel(
+                channels_g.get("gradients") or {},
+                channels_n.get("gradients") or {},
+                gpu_root,
+                npu_root,
+                float(args.atol),
+                float(args.rtol),
+                [str(item) for item in hooks.get("gradient_layers", [])],
+            ),
+            aligned_cosine=float(args.aligned_cosine),
+            usable_cosine=float(args.usable_cosine),
+            aligned_p95=float(args.aligned_p95),
+            usable_p95=float(args.usable_p95),
         )
+        quality_counts = _summarize_quality(fne)
+        allowed = {"strict_pass", "aligned_with_tolerance", "usable_drift"}
+        fne_qualities = {str(row.get("quality")) for row in fne}
+        usable_forward = output.get("quality") in allowed and all(str(row.get("quality")) in allowed for row in fne)
+        all_aligned = output.get("quality") in {"strict_pass", "aligned_with_tolerance"} and all(
+            str(row.get("quality")) in {"strict_pass", "aligned_with_tolerance"} for row in fne
+        )
+        numerical_verdict = (
+            "aligned"
+            if all_aligned
+            else ("usable_with_drift" if usable_forward else ("outlier_dominated" if "outlier_dominated" in fne_qualities else "diverged"))
+        )
+        gpu_metrics = channels_g.get("task_metrics") or {}
+        npu_metrics = channels_n.get("task_metrics") or {}
         results.append(
             {
                 "model_id": model_id,
                 "display_name": model.get("display_name"),
                 "figure_role": model.get("figure_role"),
                 "passed": bool(output.get("passed") and all(row.get("passed") is not False for row in fne)),
+                "benchmark_usable": usable_forward,
+                "numerical_verdict": numerical_verdict,
                 "output_drift": output,
                 "fne_curve": fne,
                 "gc_curve": gc,
+                "fne_quality_counts": quality_counts,
                 "first_divergence_layer": _first_divergence(fne, float(args.cosine_threshold)),
-                "gpu_task_metrics": channels_g.get("task_metrics") or {},
-                "npu_task_metrics": channels_n.get("task_metrics") or {},
+                "first_quality_drop_layer": _first_quality_drop(fne, allowed),
+                "latency_ratio_npu_over_gpu": _latency_ratio(gpu_metrics, npu_metrics),
+                "gpu_task_metrics": gpu_metrics,
+                "npu_task_metrics": npu_metrics,
             }
         )
     figure_candidates = [
@@ -1045,13 +1268,33 @@ def cmd_compare(args: argparse.Namespace) -> int:
             "models": len(results),
             "passed": sum(1 for item in results if item.get("passed")),
             "failed": sum(1 for item in results if not item.get("passed")),
+            "benchmark_usable": sum(1 for item in results if item.get("benchmark_usable")),
+            "aligned": sum(1 for item in results if item.get("numerical_verdict") == "aligned"),
+            "usable_with_drift": sum(1 for item in results if item.get("numerical_verdict") == "usable_with_drift"),
+            "outlier_dominated": sum(1 for item in results if item.get("numerical_verdict") == "outlier_dominated"),
+            "diverged": sum(1 for item in results if item.get("numerical_verdict") == "diverged"),
             "missing": len(missing_models),
         },
+        "quality_thresholds": {
+            "strict": {"atol": float(args.atol), "rtol": float(args.rtol)},
+            "aligned": {"cosine": float(args.aligned_cosine), "p95": float(args.aligned_p95)},
+            "usable": {"cosine": float(args.usable_cosine), "p95": float(args.usable_p95)},
+        },
+        "benchmark_verdict": "usable_partial" if results else "unusable_no_overlap",
         "figure_candidates": figure_candidates,
         "missing_models": missing_models,
         "models": results,
     }
+    if len(results) == len(models) and all(item.get("benchmark_usable") for item in results):
+        summary["benchmark_verdict"] = "usable_complete"
+    elif not results:
+        summary["benchmark_verdict"] = "unusable_no_overlap"
+    elif len(results) < len(models):
+        summary["benchmark_verdict"] = "usable_partial"
+    elif any(not item.get("benchmark_usable") for item in results):
+        summary["benchmark_verdict"] = "needs_drift_review"
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    _write_model_suite_source_data(summary, out_dir)
     print(json.dumps({"summary_json": str((out_dir / "summary.json").resolve()), "totals": summary["totals"]}, indent=2))
     return 0 if results and summary["totals"]["failed"] == 0 else 1
 
@@ -1110,6 +1353,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_compare.add_argument("--atol", type=float, default=1e-5)
     p_compare.add_argument("--rtol", type=float, default=1e-5)
     p_compare.add_argument("--cosine-threshold", type=float, default=0.999)
+    p_compare.add_argument("--aligned-cosine", type=float, default=0.9999)
+    p_compare.add_argument("--usable-cosine", type=float, default=0.99)
+    p_compare.add_argument("--aligned-p95", type=float, default=1e-2)
+    p_compare.add_argument("--usable-p95", type=float, default=5e-2)
     p_compare.set_defaults(func=cmd_compare)
     return parser
 
