@@ -56,6 +56,8 @@ data = json.loads(summary_path.read_text(encoding="utf-8"))
 print(json.dumps(
     {
         "summary_json": str(summary_path.resolve()),
+        "summary_md": data.get("human_report") or str((summary_path.parent / "summary.md").resolve()),
+        "figures": data.get("figure_outputs") or [],
         "benchmark_verdict": data.get("benchmark_verdict"),
         "totals": data.get("totals"),
         "source_data": [

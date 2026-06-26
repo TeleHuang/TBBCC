@@ -56,8 +56,10 @@ explicitly asks for CI-style strict exit behavior.
 Always read:
 
 - `<out-dir>/summary.json`
+- `<out-dir>/summary.md`
 - `<out-dir>/source_data/model_summary.csv`
 - `<out-dir>/source_data/layerwise_fne.csv`
+- `<out-dir>/figures/figure_1_numeric_alignment.pdf` and `.svg` when present
 
 Report:
 
@@ -68,6 +70,7 @@ Report:
 - first divergence / first quality-drop layer
 - missing model `npu_error` when present
 - source-data CSV paths
+- manuscript-ready figure paths
 
 Do not describe `eval-suite` local-pair metrics as formal GPU-vs-NPU numeric
 accuracy. Formal numeric accuracy uses GPU reference artifacts versus NPU bridge

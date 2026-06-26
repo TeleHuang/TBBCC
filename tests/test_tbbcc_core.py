@@ -659,6 +659,7 @@ def test_artifact_compare_matches_gpu_and_bridge_outputs(tmp_path: Path, capsys:
 
 def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     np = pytest.importorskip("numpy")
+    pytest.importorskip("matplotlib")
     registry = ROOT / "benchmarks" / "model_zoo" / "registry.json"
     suite = ROOT / "benchmarks" / "model_zoo" / "suites" / "canonical_models.json"
     models = json.loads(registry.read_text(encoding="utf-8"))["models"]
@@ -754,6 +755,11 @@ def test_canonical_model_suite_compare_produces_figure_candidates(tmp_path: Path
     resnet = next(item for item in summary["models"] if item["model_id"] == "resnet18_imagenet_224")
     assert resnet["first_divergence_layer"] == "layer1"
     assert resnet["numerical_verdict"] == "diverged"
+    assert (out / "summary.md").is_file()
+    assert "Manuscript Draft" in (out / "summary.md").read_text(encoding="utf-8")
+    assert {Path(path).suffix for path in summary["figure_outputs"]} == {".svg", ".pdf", ".tiff", ".png"}
+    for figure_path in summary["figure_outputs"]:
+        assert Path(figure_path).is_file()
     assert (out / "source_data" / "layerwise_fne.csv").is_file()
     assert (out / "source_data" / "model_summary.csv").is_file()
 

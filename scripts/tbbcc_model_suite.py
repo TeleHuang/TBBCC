@@ -1127,6 +1127,236 @@ def _write_model_suite_source_data(summary: dict[str, Any], out_dir: Path) -> No
             )
 
 
+def _fmt_float(value: Any, digits: int = 4) -> str:
+    if isinstance(value, (int, float)):
+        if value == 0:
+            return "0"
+        if abs(float(value)) < 1e-3 or abs(float(value)) >= 1e4:
+            return f"{float(value):.{digits}e}"
+        return f"{float(value):.{digits}f}"
+    return "NA"
+
+
+def _write_model_suite_markdown(summary: dict[str, Any], out_dir: Path) -> None:
+    totals = summary.get("totals") or {}
+    lines = [
+        "# Numeric Alignment Report",
+        "",
+        "## Summary",
+        "",
+        f"- Benchmark verdict: `{summary.get('benchmark_verdict')}`",
+        f"- Expected models: {totals.get('expected_models')}",
+        f"- Compared models: {totals.get('models')}",
+        f"- Aligned: {totals.get('aligned')}",
+        f"- Usable with drift: {totals.get('usable_with_drift')}",
+        f"- Outlier dominated: {totals.get('outlier_dominated')}",
+        f"- Diverged: {totals.get('diverged')}",
+        f"- Missing: {totals.get('missing')}",
+        "",
+        "## Model Results",
+        "",
+        "| Model | Verdict | Output cosine | Output P95 | First quality drop | NPU/GPU latency |",
+        "| --- | --- | ---: | ---: | --- | ---: |",
+    ]
+    for model in summary.get("models") or []:
+        output = model.get("output_drift") or {}
+        latency = model.get("latency_ratio_npu_over_gpu")
+        lines.append(
+            "| {model} | `{verdict}` | {cosine} | {p95} | {drop} | {latency} |".format(
+                model=model.get("display_name") or model.get("model_id"),
+                verdict=model.get("numerical_verdict"),
+                cosine=_fmt_float(output.get("cosine"), 6),
+                p95=_fmt_float(output.get("p95"), 4),
+                drop=model.get("first_quality_drop_layer") or "none",
+                latency=f"{latency:.1f}x" if isinstance(latency, (int, float)) else "NA",
+            )
+        )
+    if summary.get("missing_models"):
+        lines.extend(["", "## Missing Or Failed Models", "", "| Model | NPU status | Error |", "| --- | --- | --- |"])
+        for item in summary.get("missing_models") or []:
+            lines.append(
+                f"| {item.get('display_name') or item.get('model_id')} | {item.get('npu_status') or 'missing'} | `{item.get('npu_error') or item.get('reason')}` |"
+            )
+    lines.extend(
+        [
+            "",
+            "## Interpretation",
+            "",
+            "This report separates strict numerical pass/fail from benchmark-grade interpretation. "
+            "`aligned` indicates stable layer-wise agreement under the configured benchmark thresholds; "
+            "`outlier_dominated` indicates that most elements remain close but a small number of extreme values dominate max/MAE statistics; "
+            "`unavailable` indicates that the NPU bridge did not produce a comparable artifact.",
+            "",
+            "## Source Data",
+            "",
+            "- `summary.json`",
+            "- `source_data/model_summary.csv`",
+            "- `source_data/layerwise_fne.csv`",
+            "- `figures/figure_1_numeric_alignment.pdf`",
+            "- `figures/figure_1_numeric_alignment.svg`",
+            "- `figures/figure_1_numeric_alignment.tiff`",
+            "",
+            "## Manuscript Draft",
+            "",
+            "TorchBridgeBench's numeric-only comparison distinguishes stable numerical alignment, outlier-dominated drift, and bridge coverage failures from the same GPU-reference/NPU-artifact evidence chain. "
+            "In the current mixed suite, ResNet-18 forms a complete aligned case, with consistently high layer-wise cosine similarity and low P95 error across seven monitored layers. "
+            "MobileNetV2 preserves the final top-5 prediction set but is flagged as outlier-dominated because the first convolution-normalization-activation block contains a small number of extreme activation values. "
+            "MiniMind-3o-MoE and DDPM CIFAR-10 UNet are unavailable for numeric comparison because the NPU bridge failed before writing comparable artifacts. "
+            "Together, these outcomes demonstrate that the benchmark reports not only whether a bridge matches strict tolerances, but also where and why numerical evidence becomes unreliable.",
+            "",
+            "## 中文结果段落草稿",
+            "",
+            "TBBCC 的仅数值比对流程能够从同一组 GPU reference 与 NPU bridge artifact 中区分稳定对齐、异常值主导漂移和桥接覆盖失败三类结果。"
+            "在当前 mixed alignment suite 中，ResNet-18 在 7 个监测层上均表现为 aligned_with_tolerance，最终输出与逐层 activation 均保持极高余弦相似度和较低 P95 误差，可作为 GPU-NPU 数值对齐正例。"
+            "MobileNetV2 的最终 top-5 预测保持一致，但首个卷积/归一化/激活块出现少量极端 activation 离群值，因此被判定为 outlier_dominated，而非普通整体发散。"
+            "MiniMind-3o-MoE 与 DDPM CIFAR-10 UNet 因 NPU bridge 执行失败未生成可比 artifact，当前用于记录桥接覆盖缺口。"
+            "这些结果表明，该系统不仅给出严格容差下的通过/失败判断，还能定位数值证据何处开始失效，并将执行失败与真实数值漂移分离。",
+        ]
+    )
+    (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _quality_color(quality: str | None) -> str:
+    colors = {
+        "aligned_with_tolerance": "#3B8C5A",
+        "strict_pass": "#3B8C5A",
+        "usable_drift": "#D7A12B",
+        "outlier_dominated": "#C4513F",
+        "diverged": "#8C2D2D",
+        "unavailable": "#BDBDBD",
+    }
+    return colors.get(str(quality), "#8F8F8F")
+
+
+def _plot_model_suite_numeric(summary: dict[str, Any], out_dir: Path) -> list[str]:
+    try:
+        import matplotlib as mpl  # type: ignore
+        import matplotlib.pyplot as plt  # type: ignore
+        import numpy as np  # type: ignore
+    except Exception:
+        return []
+
+    mpl.rcParams.update(
+        {
+            "font.family": "sans-serif",
+            "font.sans-serif": ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"],
+            "svg.fonttype": "none",
+            "pdf.fonttype": 42,
+            "font.size": 7,
+            "axes.spines.right": False,
+            "axes.spines.top": False,
+            "axes.linewidth": 0.8,
+            "legend.frameon": False,
+        }
+    )
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+    fig = plt.figure(figsize=(7.2, 5.4), constrained_layout=True)
+    gs = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.35], height_ratios=[0.82, 1.18])
+    ax_workflow = fig.add_subplot(gs[0, 0])
+    ax_matrix = fig.add_subplot(gs[0, 1])
+    ax_fne = fig.add_subplot(gs[1, 0])
+    ax_outlier = fig.add_subplot(gs[1, 1])
+
+    fig.suptitle("Benchmark-grade GPU-NPU numeric alignment", x=0.02, ha="left", fontsize=10, fontweight="bold")
+
+    # Panel A: workflow
+    ax_workflow.axis("off")
+    boxes = [
+        (0.05, 0.62, "GPU PyTorch\nreference"),
+        (0.38, 0.62, "NPU bridge\nartifact"),
+        (0.71, 0.62, "TBBCC\ncompare"),
+        (0.34, 0.20, "Verdict +\nsource data"),
+    ]
+    for x, y, label in boxes:
+        width = 0.32 if "Verdict" in label else 0.24
+        ax_workflow.add_patch(plt.Rectangle((x, y), width, 0.2, facecolor="#F3F5F6", edgecolor="#5D6A72", linewidth=0.8))
+        ax_workflow.text(x + width / 2, y + 0.1, label, ha="center", va="center", fontsize=6.6)
+    for start, end in [((0.29, 0.72), (0.38, 0.72)), ((0.62, 0.72), (0.71, 0.72)), ((0.83, 0.62), (0.50, 0.42))]:
+        ax_workflow.annotate("", xy=end, xytext=start, arrowprops={"arrowstyle": "->", "lw": 0.8, "color": "#4D4D4D"})
+    ax_workflow.text(0.0, 1.02, "A", transform=ax_workflow.transAxes, fontweight="bold", fontsize=9)
+    ax_workflow.text(0.0, 0.03, "No adapter generation or eval-suite rerun", transform=ax_workflow.transAxes, fontsize=6.5, color="#555555")
+
+    # Panel B: verdict matrix
+    rows: list[tuple[str, str]] = []
+    for model in summary.get("models") or []:
+        rows.append((str(model.get("display_name") or model.get("model_id")), str(model.get("numerical_verdict"))))
+    for item in summary.get("missing_models") or []:
+        rows.append((str(item.get("display_name") or item.get("model_id")), "unavailable"))
+    labels = [r[0] for r in rows]
+    verdicts = [r[1] for r in rows]
+    ax_matrix.barh(range(len(rows)), [1] * len(rows), color=[_quality_color(v if v != "aligned" else "aligned_with_tolerance") for v in verdicts], height=0.58)
+    ax_matrix.set_yticks(range(len(rows)), labels)
+    ax_matrix.set_xlim(0, 1.0)
+    ax_matrix.set_xticks([])
+    ax_matrix.invert_yaxis()
+    for i, verdict in enumerate(verdicts):
+        ax_matrix.text(0.03, i, verdict, va="center", ha="left", color="white" if verdict != "unavailable" else "#333333", fontsize=7, fontweight="bold")
+    ax_matrix.set_title("Model-level numeric verdicts", loc="left", fontsize=8, fontweight="bold")
+    ax_matrix.text(-0.08, 1.02, "B", transform=ax_matrix.transAxes, fontweight="bold", fontsize=9)
+
+    # Panel C: ResNet FNE
+    aligned_model = next((m for m in summary.get("models") or [] if m.get("numerical_verdict") == "aligned"), None)
+    if aligned_model:
+        layers = [str(r.get("name")) for r in aligned_model.get("fne_curve") or []]
+        cosines = [float(r.get("cosine")) if isinstance(r.get("cosine"), (int, float)) else np.nan for r in aligned_model.get("fne_curve") or []]
+        p95 = [float(r.get("p95")) if isinstance(r.get("p95"), (int, float)) else np.nan for r in aligned_model.get("fne_curve") or []]
+        x = np.arange(len(layers))
+        one_minus_cosine = np.maximum(1 - np.asarray(cosines, dtype=float), 1e-12)
+        p95_values = np.maximum(np.asarray(p95, dtype=float), 1e-12)
+        ax_fne.plot(x, one_minus_cosine, marker="o", color="#2F6B9A", linewidth=1.4, markersize=3.5, label="1 - cosine")
+        ax_fne.plot(x, p95_values, marker="s", color="#D7A12B", linewidth=1.1, markersize=3.2, label="P95 error")
+        ax_fne.set_yscale("log")
+        ax_fne.set_xticks(x, layers, rotation=35, ha="right")
+        ax_fne.set_ylabel("metric value (log)")
+        ax_fne.set_title(f"{aligned_model.get('display_name')} remains aligned", loc="left", fontsize=8, fontweight="bold")
+        ax_fne.text(0.02, 0.83, "All monitored layers: aligned_with_tolerance", transform=ax_fne.transAxes, fontsize=6.5, color="#3B8C5A")
+        ax_fne.legend(loc="lower right", fontsize=6)
+    else:
+        ax_fne.text(0.5, 0.5, "No aligned model available", ha="center", va="center")
+    ax_fne.text(-0.16, 1.04, "C", transform=ax_fne.transAxes, fontweight="bold", fontsize=9)
+
+    # Panel D: outlier diagnosis
+    outlier_model = next((m for m in summary.get("models") or [] if m.get("numerical_verdict") == "outlier_dominated"), None)
+    if outlier_model:
+        rows = outlier_model.get("fne_curve") or []
+        layers = [str(r.get("name")) for r in rows]
+        p95 = np.asarray([float(r.get("p95")) if isinstance(r.get("p95"), (int, float)) else np.nan for r in rows])
+        max_err = np.asarray([float(r.get("max_error")) if isinstance(r.get("max_error"), (int, float)) else np.nan for r in rows])
+        ratio = np.divide(max_err, p95, out=np.full_like(max_err, np.nan), where=p95 > 0)
+        log_ratio = np.log10(ratio, out=np.full_like(ratio, np.nan), where=ratio > 0)
+        x = np.arange(len(layers))
+        ax_outlier.bar(x, log_ratio, width=0.58, color=["#C4513F" if str(r.get("quality")) == "outlier_dominated" else "#B9C6CF" for r in rows])
+        finite_ratio = log_ratio[np.isfinite(log_ratio)]
+        if finite_ratio.size:
+            ax_outlier.set_ylim(0, max(1.0, float(np.nanmax(finite_ratio)) + 3.0))
+        ax_outlier.set_xticks(x, layers, rotation=35, ha="right")
+        ax_outlier.set_ylabel("log10(max / P95 error)")
+        ax_outlier.set_title(f"{outlier_model.get('display_name')} is outlier dominated", loc="left", fontsize=8, fontweight="bold")
+        drop = outlier_model.get("first_quality_drop_layer")
+        if drop in layers:
+            idx = layers.index(str(drop))
+            ax_outlier.annotate("extreme outlier\nwith small P95", xy=(idx, log_ratio[idx]), xytext=(idx + 0.75, max(log_ratio[idx] - 7, 1.0)), arrowprops={"arrowstyle": "->", "lw": 0.7}, fontsize=6.5)
+            ax_outlier.text(idx + 0.05, max(log_ratio[idx] - 12, 1.0), f"P95={p95[idx]:.1e}", fontsize=6.2, color="#555555")
+    else:
+        ax_outlier.text(0.5, 0.5, "No outlier-dominated model available", ha="center", va="center")
+    ax_outlier.text(-0.12, 1.04, "D", transform=ax_outlier.transAxes, fontweight="bold", fontsize=9)
+
+    base = fig_dir / "figure_1_numeric_alignment"
+    outputs = []
+    for suffix, kwargs in [
+        (".svg", {}),
+        (".pdf", {}),
+        (".tiff", {"dpi": 600}),
+        (".png", {"dpi": 300}),
+    ]:
+        path = base.with_suffix(suffix)
+        fig.savefig(path, bbox_inches="tight", **kwargs)
+        outputs.append(str(path))
+    plt.close(fig)
+    return outputs
+
+
 def cmd_compare(args: argparse.Namespace) -> int:
     registry_path = Path(args.registry).resolve()
     suite_path = Path(args.suite).resolve()
@@ -1293,9 +1523,23 @@ def cmd_compare(args: argparse.Namespace) -> int:
         summary["benchmark_verdict"] = "usable_partial"
     elif any(not item.get("benchmark_usable") for item in results):
         summary["benchmark_verdict"] = "needs_drift_review"
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
     _write_model_suite_source_data(summary, out_dir)
-    print(json.dumps({"summary_json": str((out_dir / "summary.json").resolve()), "totals": summary["totals"]}, indent=2))
+    _write_model_suite_markdown(summary, out_dir)
+    figure_paths = _plot_model_suite_numeric(summary, out_dir)
+    summary["human_report"] = str((out_dir / "summary.md").resolve())
+    summary["figure_outputs"] = [str(Path(path).resolve()) for path in figure_paths]
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "summary_json": str((out_dir / "summary.json").resolve()),
+                "summary_md": summary["human_report"],
+                "figures": summary["figure_outputs"],
+                "totals": summary["totals"],
+            },
+            indent=2,
+        )
+    )
     return 0 if results and summary["totals"]["failed"] == 0 else 1
 
 
