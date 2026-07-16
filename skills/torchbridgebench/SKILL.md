@@ -36,9 +36,10 @@ Read these files before nontrivial work:
    ```
 
    Use defaults when paths are not supplied:
-   `${CLAUDE_PLUGIN_ROOT}/reports/mixed_alignment_gpu` for GPU artifacts,
-   newest non-failed `mixed_alignment_torch4ms_npu*` for NPU artifacts, and
-   `${CLAUDE_PLUGIN_ROOT}/reports/mixed_alignment_gpu_vs_npu_numeric` for output.
+   `${CLAUDE_PLUGIN_ROOT}/../HTLsAgentsChat/artifacts/paper2/experiments/numeric-alignment/gpu-reference`
+   for GPU artifacts, the adjacent `npu-bridge` directory for NPU artifacts,
+   and `artifacts/paper2/results/numeric-alignment` for output. Use
+   `TBBCC_MATERIALS_ROOT` when AgentsChat is not a sibling repository.
    Read `summary.json`, `source_data/model_summary.csv`, and
    `source_data/layerwise_fne.csv` before concluding. The wrapper succeeds when
    a report is written; strict numerical failures are report data, not command

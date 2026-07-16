@@ -26,10 +26,11 @@ This workflow only compares existing artifacts. It must not:
 Use these defaults unless the user provides another path:
 
 - suite: `${CLAUDE_PLUGIN_ROOT}/benchmarks/model_zoo/suites/mixed_alignment_30min.json`
-- GPU root: `${CLAUDE_PLUGIN_ROOT}/reports/mixed_alignment_gpu`
-- NPU root: newest `${CLAUDE_PLUGIN_ROOT}/reports/mixed_alignment_torch4ms_npu*`
-  directory that is not marked failed, or `TBBCC_NPU_ROOT` when provided
-- output: `${CLAUDE_PLUGIN_ROOT}/reports/mixed_alignment_gpu_vs_npu_numeric`
+- materials root: `${CLAUDE_PLUGIN_ROOT}/../HTLsAgentsChat/artifacts/paper2`, or
+  `TBBCC_MATERIALS_ROOT` when the coordination repository is elsewhere
+- GPU root: `<materials-root>/experiments/numeric-alignment/gpu-reference`
+- NPU root: `<materials-root>/experiments/numeric-alignment/npu-bridge`
+- output: `<materials-root>/results/numeric-alignment`
 
 ## Commands
 
@@ -44,7 +45,7 @@ bash ${CLAUDE_PLUGIN_ROOT}/scripts/run_numeric_compare_only.sh
 ```
 
 If the user does not provide paths, omit the environment variables and let the
-wrapper use defaults or discover the newest NPU artifact root.
+wrapper use the versioned AgentsChat material locations.
 
 ## Interpretation
 

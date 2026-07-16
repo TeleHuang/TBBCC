@@ -221,3 +221,20 @@ def test_canonical_model_suite_registry_is_fixed() -> None:
         assert model["hooks"]["activation_layers"], model_id
         assert model["hooks"]["gradient_layers"], model_id
         assert model["figure_role"], model_id
+
+
+def test_numeric_wrappers_default_to_agents_chat_material_store() -> None:
+    scripts = [
+        "run_mixed_alignment_gpu_reference.sh",
+        "run_mixed_alignment_npu_bridge.sh",
+        "run_mixed_alignment_compare.sh",
+        "run_numeric_compare_only.sh",
+    ]
+    for filename in scripts:
+        source = (ROOT / "scripts" / filename).read_text(encoding="utf-8")
+        assert "HTLsAgentsChat" in source, filename
+        assert "artifacts/paper2" in source, filename
+
+    compare = (ROOT / "scripts/run_numeric_compare_only.sh").read_text(encoding="utf-8")
+    assert "results/numeric-alignment" in compare
+    assert "find reports" not in compare
