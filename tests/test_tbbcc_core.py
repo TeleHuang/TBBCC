@@ -898,6 +898,67 @@ def test_model_suite_bridge_preamble_runs_after_model_setup() -> None:
     assert adapter_exec < source.index("_forward_model(")
 
 
+def test_minimind_npu_load_avoids_accelerate_meta_initialization() -> None:
+    gpu_kwargs = tbbcc_model_suite._minimind_load_kwargs("gpu-reference")
+    npu_kwargs = tbbcc_model_suite._minimind_load_kwargs("npu-bridge")
+
+    assert gpu_kwargs["device_map"] == "auto"
+    assert gpu_kwargs["low_cpu_mem_usage"] is True
+    assert "device_map" not in npu_kwargs
+    assert npu_kwargs["low_cpu_mem_usage"] is False
+
+
+def test_hf_local_files_only_parses_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TBBCC_HF_LOCAL_FILES_ONLY", raising=False)
+    assert tbbcc_model_suite._hf_local_files_only() is None
+    monkeypatch.setenv("TBBCC_HF_LOCAL_FILES_ONLY", "1")
+    assert tbbcc_model_suite._hf_local_files_only() is True
+    monkeypatch.setenv("TBBCC_HF_LOCAL_FILES_ONLY", "false")
+    assert tbbcc_model_suite._hf_local_files_only() is False
+
+
+def test_manuscript_result_text_reflects_current_artifacts() -> None:
+    summary = {
+        "models": [
+            {
+                "display_name": "MiniMind",
+                "numerical_verdict": "usable_with_drift",
+                "output_drift": {"cosine": 0.9992, "p95": 0.0175},
+            },
+            {
+                "display_name": "DDPM",
+                "numerical_verdict": "aligned",
+                "output_drift": {"cosine": 1.0, "p95": 0.0007},
+            },
+        ],
+        "missing_models": [],
+    }
+
+    text = tbbcc_model_suite._manuscript_result_text(summary, chinese=False)
+    assert "MiniMind shows usable, bounded drift" in text
+    assert "DDPM shows stable alignment" in text
+    assert "unavailable" not in text
+
+
+def test_collect_parser_accepts_model_process_isolation() -> None:
+    args = tbbcc_model_suite.build_parser().parse_args(
+        ["collect", "--out", "report", "--role", "npu-bridge", "--isolate-models"]
+    )
+
+    assert args.isolate_models is True
+
+
+def test_diagnostic_panel_falls_back_to_largest_usable_drift() -> None:
+    models = [
+        {"model_id": "small", "numerical_verdict": "usable_with_drift", "output_drift": {"p95": 0.001}},
+        {"model_id": "large", "numerical_verdict": "usable_with_drift", "output_drift": {"p95": 0.02}},
+    ]
+
+    selected, kind = tbbcc_model_suite._select_diagnostic_model(models)
+    assert kind == "drift"
+    assert selected["model_id"] == "large"
+
+
 def test_find_eval_caches_matches_bridge_and_suite_scope(tmp_path: Path) -> None:
     case = tmp_path / "benchmarks" / "case.json"
     suite = tmp_path / "benchmarks" / "suite.json"

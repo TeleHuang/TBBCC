@@ -47,11 +47,16 @@ collect gradients. The runner compares logits and selected hidden states only.
 
 ## Weight Storage
 
-Weights are not stored in this repository. Set:
+Weights are not stored in this repository. Use a persistent cache root. On the
+NPU server the recommended path is:
 
 ```bash
-export TBBCC_MODEL_CACHE=/path/to/tbbcc_models
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
 ```
+
+The runner maps this root to `$TBBCC_MODEL_CACHE/torch` for torchvision
+checkpoints, `$TBBCC_MODEL_CACHE/hf` for Hugging Face and diffusers snapshots,
+and `$TBBCC_MODEL_CACHE/timm` for timm checkpoints.
 
 Recommended sources:
 
@@ -68,6 +73,28 @@ Recommended sources:
   `jingyaogong/minimind-3o-moe`, or point `TBBCC_LM_LOCATOR` at a local
   checkpoint directory.
 - DDPM CIFAR-10 UNet 32: `diffusers.UNet2DModel.from_pretrained("google/ddpm-cifar10-32")`
+
+Preferred download method: run the cache-preparation script directly on the NPU
+server so the cache is created in place:
+
+```bash
+cd /home/ma-user/work/torchbridgebenchCCplugin
+source /home/ma-user/work/activate_torch4ms_ms272_cann85.sh
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
+python -m pip install -U huggingface_hub diffusers transformers accelerate safetensors
+python scripts/download_model_weights.py \
+  --suite benchmarks/model_zoo/suites/mixed_alignment_30min.json \
+  --cache-dir "$TBBCC_MODEL_CACHE"
+```
+
+Fallback method: if the NPU server cannot access the model hosts, run the same
+command on a PC, archive the resulting `tbbcc_model_cache/`, upload it to the
+NPU server, and unpack it under `/home/ma-user/work`. For formal runs, set:
+
+```bash
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
+export TBBCC_HF_LOCAL_FILES_ONLY=1
+```
 
 The current runner looks for the UNet checkpoint at:
 

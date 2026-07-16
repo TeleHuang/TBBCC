@@ -15,10 +15,17 @@ import hashlib
 import json
 import os
 import platform
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
+
+# MindSpore 2.7.2 ships generated protobuf modules that are incompatible with
+# protobuf 4+ C++ descriptors when Transformers is imported first.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -267,7 +274,40 @@ def _build_unet_small() -> Any:
     return UNetSmall()
 
 
-def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) -> tuple[Any, dict[str, Any]]:
+def _hf_local_files_only() -> bool | None:
+    value = os.environ.get("TBBCC_HF_LOCAL_FILES_ONLY")
+    if value is None:
+        return None
+    return value not in {"0", "false", "False"}
+
+
+def _minimind_load_kwargs(role: str) -> dict[str, Any]:
+    import torch  # type: ignore
+
+    kwargs: dict[str, Any] = {
+        "torch_dtype": torch.float16,
+        "trust_remote_code": True,
+    }
+    if role == "gpu-reference":
+        kwargs.update(
+            {
+                "device_map": os.environ.get("TBBCC_LLM_DEVICE_MAP", "auto"),
+                "low_cpu_mem_usage": True,
+            }
+        )
+    else:
+        # Accelerate's meta initialization is incompatible with the torch4ms
+        # intercept path, which materializes model parameters through MindSpore.
+        kwargs["low_cpu_mem_usage"] = False
+    local_files_only = _hf_local_files_only()
+    if local_files_only is not None:
+        kwargs["local_files_only"] = local_files_only
+    return kwargs
+
+
+def _build_model(
+    model: dict[str, Any], *, pretrained: bool, cache_dir: Path, role: str = "gpu-reference"
+) -> tuple[Any, dict[str, Any]]:
     import torch  # type: ignore
 
     os.environ.setdefault("TORCH_HOME", str(cache_dir / "torch"))
@@ -320,28 +360,23 @@ def _build_model(model: dict[str, Any], *, pretrained: bool, cache_dir: Path) ->
         locator = str(checkpoint["locator"])
         return AutoModel.from_pretrained(locator) if pretrained else AutoModel.from_config(_bert_tiny_config()), checkpoint
     if model_id == "minimind3o_moe_seq128":
-        import torch  # type: ignore
         from transformers import AutoModelForCausalLM  # type: ignore
 
         locator = os.environ.get("TBBCC_LM_LOCATOR", str(checkpoint["locator"]))
         if not pretrained:
             raise SystemExit("minimind3o_moe_seq128 requires pretrained weights or a local checkpoint path.")
-        load_kwargs = {
-            "torch_dtype": torch.float16,
-            "device_map": os.environ.get("TBBCC_LLM_DEVICE_MAP", "auto"),
-            "trust_remote_code": True,
-            "low_cpu_mem_usage": True,
-        }
-        local_files_only = os.environ.get("TBBCC_HF_LOCAL_FILES_ONLY")
-        if local_files_only is not None:
-            load_kwargs["local_files_only"] = local_files_only not in {"0", "false", "False"}
+        load_kwargs = _minimind_load_kwargs(role)
         return AutoModelForCausalLM.from_pretrained(locator, **load_kwargs).eval(), checkpoint
     if model_id == "ddpm_cifar10_unet_32":
         if pretrained:
             from diffusers import UNet2DModel  # type: ignore
 
             locator = str(checkpoint["locator"])
-            return UNet2DModel.from_pretrained(locator).eval(), checkpoint
+            load_kwargs = {}
+            local_files_only = _hf_local_files_only()
+            if local_files_only is not None:
+                load_kwargs["local_files_only"] = local_files_only
+            return UNet2DModel.from_pretrained(locator, **load_kwargs).eval(), checkpoint
         return _build_tiny_ddpm_unet().eval(), checkpoint
     if model_id == "unet_small_biosample_256":
         net = _build_unet_small().eval()
@@ -632,7 +667,12 @@ def _run_one_model(args: argparse.Namespace, model: dict[str, Any], registry_pat
     model_dir = out_dir / model_id
     artifact_dir = model_dir / "artifacts"
     model_dir.mkdir(parents=True, exist_ok=True)
-    net, checkpoint = _build_model(model, pretrained=not bool(args.no_pretrained), cache_dir=cache_dir)
+    net, checkpoint = _build_model(
+        model,
+        pretrained=not bool(args.no_pretrained),
+        cache_dir=cache_dir,
+        role=role,
+    )
     device = torch.device(device_name)
     if not bool(model.get("device_map_managed")):
         net.to(device)
@@ -832,7 +872,13 @@ def cmd_collect(args: argparse.Namespace) -> int:
             )
             break
         try:
-            cases.append(_run_one_model(args, model, registry_path, suite_path))
+            if bool(getattr(args, "isolate_models", False)):
+                remaining_budget = None
+                if budget_seconds is not None:
+                    remaining_budget = max(1.0, budget_seconds - (time.perf_counter() - wall_started))
+                cases.append(_run_one_model_isolated(args, model, out_dir, remaining_budget))
+            else:
+                cases.append(_run_one_model(args, model, registry_path, suite_path))
         except Exception as exc:
             failures.append({"model_id": model.get("model_id"), "status": "failed", "error": repr(exc)})
             if not bool(args.keep_going):
@@ -868,6 +914,71 @@ def cmd_collect(args: argparse.Namespace) -> int:
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     print(json.dumps({"manifest_json": str((out_dir / "manifest.json").resolve()), "totals": manifest["totals"]}, indent=2))
     return 0 if not failures else 1
+
+
+def _run_one_model_isolated(
+    args: argparse.Namespace,
+    model: dict[str, Any],
+    out_dir: Path,
+    remaining_budget: float | None,
+) -> dict[str, Any]:
+    model_id = str(model["model_id"])
+    with tempfile.TemporaryDirectory(prefix=f"tbbcc-{model_id}-", dir=out_dir) as temporary:
+        child_out = Path(temporary)
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "collect",
+            "--registry",
+            str(Path(args.registry).resolve()),
+            "--suite",
+            str(Path(args.suite).resolve()),
+            "--out",
+            str(child_out),
+            "--role",
+            str(args.role),
+            "--device",
+            str(args.device),
+            "--model-id",
+            model_id,
+            "--model-cache",
+            str(args.model_cache),
+            "--seed",
+            str(args.seed),
+            "--keep-going",
+        ]
+        for option, value in (("--adapter", args.adapter), ("--input-root", args.input_root)):
+            if value:
+                command.extend([option, str(value)])
+        if remaining_budget is not None:
+            command.extend(["--time-budget-seconds", str(remaining_budget)])
+        if bool(args.strict_input_root):
+            command.append("--strict-input-root")
+        if bool(args.no_pretrained):
+            command.append("--no-pretrained")
+        if bool(args.allow_cpu_fallback):
+            command.append("--allow-cpu-fallback")
+
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        manifest_path = child_out / "manifest.json"
+        if not manifest_path.exists():
+            raise RuntimeError(
+                f"Isolated model process failed for {model_id} (exit {completed.returncode}): "
+                f"{completed.stderr[-2000:]}"
+            )
+        child_manifest = _load_json(manifest_path)
+        child_cases = child_manifest.get("cases") or []
+        if len(child_cases) != 1 or child_cases[0].get("status") != "passed":
+            detail = child_cases[0] if child_cases else completed.stderr[-2000:]
+            raise RuntimeError(f"Isolated model process failed for {model_id}: {detail}")
+
+        source_model_dir = child_out / model_id
+        target_model_dir = out_dir / model_id
+        shutil.copytree(source_model_dir, target_model_dir, dirs_exist_ok=True)
+        result = dict(child_cases[0])
+        result["artifact_json"] = str((target_model_dir / "model_artifact.json").resolve())
+        result["isolated_process"] = True
+        return result
 
 
 def _artifact_path(root: Path, model_id: str) -> Path:
@@ -1137,6 +1248,36 @@ def _fmt_float(value: Any, digits: int = 4) -> str:
     return "NA"
 
 
+def _manuscript_result_text(summary: dict[str, Any], *, chinese: bool) -> str:
+    verdict_labels = {
+        "aligned": ("stable alignment", "稳定对齐"),
+        "usable_with_drift": ("usable, bounded drift", "存在可用且有界的漂移"),
+        "outlier_dominated": ("outlier-dominated drift", "异常值主导的漂移"),
+        "diverged": ("numerical divergence", "数值发散"),
+    }
+    results = []
+    for model in summary.get("models") or []:
+        name = str(model.get("display_name") or model.get("model_id"))
+        verdict = str(model.get("numerical_verdict"))
+        label = verdict_labels.get(verdict, (verdict, verdict))[1 if chinese else 0]
+        output = model.get("output_drift") or {}
+        cosine = _fmt_float(output.get("cosine"), 6)
+        p95 = _fmt_float(output.get("p95"), 4)
+        if chinese:
+            results.append(f"{name} 表现为{label}（输出余弦相似度 {cosine}，P95 绝对误差 {p95}）")
+        else:
+            results.append(f"{name} shows {label} (output cosine {cosine}; P95 absolute error {p95})")
+    for model in summary.get("missing_models") or []:
+        name = str(model.get("display_name") or model.get("model_id"))
+        error = str(model.get("npu_error") or model.get("reason") or "missing artifact")
+        if chinese:
+            results.append(f"{name} 未生成可比 artifact（{error}）")
+        else:
+            results.append(f"{name} has no comparable artifact ({error})")
+    separator = "；" if chinese else "; "
+    return separator.join(results) + ("。" if chinese and results else "." if results else "")
+
+
 def _write_model_suite_markdown(summary: dict[str, Any], out_dir: Path) -> None:
     totals = summary.get("totals") or {}
     lines = [
@@ -1198,19 +1339,19 @@ def _write_model_suite_markdown(summary: dict[str, Any], out_dir: Path) -> None:
             "",
             "## Manuscript Draft",
             "",
-            "TorchBridgeBench's numeric-only comparison distinguishes stable numerical alignment, outlier-dominated drift, and bridge coverage failures from the same GPU-reference/NPU-artifact evidence chain. "
-            "In the current mixed suite, ResNet-18 forms a complete aligned case, with consistently high layer-wise cosine similarity and low P95 error across seven monitored layers. "
-            "MobileNetV2 preserves the final top-5 prediction set but is flagged as outlier-dominated because the first convolution-normalization-activation block contains a small number of extreme activation values. "
-            "MiniMind-3o-MoE and DDPM CIFAR-10 UNet are unavailable for numeric comparison because the NPU bridge failed before writing comparable artifacts. "
-            "Together, these outcomes demonstrate that the benchmark reports not only whether a bridge matches strict tolerances, but also where and why numerical evidence becomes unreliable.",
+            (
+                "TorchBridgeBench's numeric-only comparison distinguishes stable numerical alignment, outlier-dominated drift, and bridge coverage failures from the same GPU-reference/NPU-artifact evidence chain. "
+                + _manuscript_result_text(summary, chinese=False)
+                + " Together, these outcomes demonstrate that the benchmark reports not only whether a bridge matches strict tolerances, but also where and why numerical evidence becomes unreliable."
+            ),
             "",
             "## 中文结果段落草稿",
             "",
-            "TBBCC 的仅数值比对流程能够从同一组 GPU reference 与 NPU bridge artifact 中区分稳定对齐、异常值主导漂移和桥接覆盖失败三类结果。"
-            "在当前 mixed alignment suite 中，ResNet-18 在 7 个监测层上均表现为 aligned_with_tolerance，最终输出与逐层 activation 均保持极高余弦相似度和较低 P95 误差，可作为 GPU-NPU 数值对齐正例。"
-            "MobileNetV2 的最终 top-5 预测保持一致，但首个卷积/归一化/激活块出现少量极端 activation 离群值，因此被判定为 outlier_dominated，而非普通整体发散。"
-            "MiniMind-3o-MoE 与 DDPM CIFAR-10 UNet 因 NPU bridge 执行失败未生成可比 artifact，当前用于记录桥接覆盖缺口。"
-            "这些结果表明，该系统不仅给出严格容差下的通过/失败判断，还能定位数值证据何处开始失效，并将执行失败与真实数值漂移分离。",
+            (
+                "TBBCC 的仅数值比对流程能够从同一组 GPU reference 与 NPU bridge artifact 中区分稳定对齐、异常值主导漂移和桥接覆盖失败三类结果。"
+                + _manuscript_result_text(summary, chinese=True)
+                + "这些结果表明，该系统不仅给出严格容差下的通过/失败判断，还能定位数值证据何处开始失效，并将执行失败与真实数值漂移分离。"
+            ),
         ]
     )
     (out_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1221,11 +1362,22 @@ def _quality_color(quality: str | None) -> str:
         "aligned_with_tolerance": "#3B8C5A",
         "strict_pass": "#3B8C5A",
         "usable_drift": "#D7A12B",
+        "usable_with_drift": "#D7A12B",
         "outlier_dominated": "#C4513F",
         "diverged": "#8C2D2D",
         "unavailable": "#BDBDBD",
     }
     return colors.get(str(quality), "#8F8F8F")
+
+
+def _select_diagnostic_model(models: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+    outlier = next((m for m in models if m.get("numerical_verdict") == "outlier_dominated"), None)
+    if outlier is not None:
+        return outlier, "outlier"
+    drift = [m for m in models if m.get("numerical_verdict") == "usable_with_drift"]
+    if drift:
+        return max(drift, key=lambda m: float((m.get("output_drift") or {}).get("p95") or 0.0)), "drift"
+    return None, "none"
 
 
 def _plot_model_suite_numeric(summary: dict[str, Any], out_dir: Path) -> list[str]:
@@ -1310,16 +1462,15 @@ def _plot_model_suite_numeric(summary: dict[str, Any], out_dir: Path) -> list[st
         ax_fne.set_xticks(x, layers, rotation=35, ha="right")
         ax_fne.set_ylabel("metric value (log)")
         ax_fne.set_title(f"{aligned_model.get('display_name')} remains aligned", loc="left", fontsize=8, fontweight="bold")
-        ax_fne.text(0.02, 0.83, "All monitored layers: aligned_with_tolerance", transform=ax_fne.transAxes, fontsize=6.5, color="#3B8C5A")
         ax_fne.legend(loc="lower right", fontsize=6)
     else:
         ax_fne.text(0.5, 0.5, "No aligned model available", ha="center", va="center")
     ax_fne.text(-0.16, 1.04, "C", transform=ax_fne.transAxes, fontweight="bold", fontsize=9)
 
-    # Panel D: outlier diagnosis
-    outlier_model = next((m for m in summary.get("models") or [] if m.get("numerical_verdict") == "outlier_dominated"), None)
-    if outlier_model:
-        rows = outlier_model.get("fne_curve") or []
+    # Panel D: strongest diagnostic case, preferring outlier evidence.
+    diagnostic_model, diagnostic_kind = _select_diagnostic_model(summary.get("models") or [])
+    if diagnostic_model and diagnostic_kind == "outlier":
+        rows = diagnostic_model.get("fne_curve") or []
         layers = [str(r.get("name")) for r in rows]
         p95 = np.asarray([float(r.get("p95")) if isinstance(r.get("p95"), (int, float)) else np.nan for r in rows])
         max_err = np.asarray([float(r.get("max_error")) if isinstance(r.get("max_error"), (int, float)) else np.nan for r in rows])
@@ -1332,14 +1483,27 @@ def _plot_model_suite_numeric(summary: dict[str, Any], out_dir: Path) -> list[st
             ax_outlier.set_ylim(0, max(1.0, float(np.nanmax(finite_ratio)) + 3.0))
         ax_outlier.set_xticks(x, layers, rotation=35, ha="right")
         ax_outlier.set_ylabel("log10(max / P95 error)")
-        ax_outlier.set_title(f"{outlier_model.get('display_name')} is outlier dominated", loc="left", fontsize=8, fontweight="bold")
-        drop = outlier_model.get("first_quality_drop_layer")
+        ax_outlier.set_title(f"{diagnostic_model.get('display_name')} is outlier dominated", loc="left", fontsize=8, fontweight="bold")
+        drop = diagnostic_model.get("first_quality_drop_layer")
         if drop in layers:
             idx = layers.index(str(drop))
             ax_outlier.annotate("extreme outlier\nwith small P95", xy=(idx, log_ratio[idx]), xytext=(idx + 0.75, max(log_ratio[idx] - 7, 1.0)), arrowprops={"arrowstyle": "->", "lw": 0.7}, fontsize=6.5)
             ax_outlier.text(idx + 0.05, max(log_ratio[idx] - 12, 1.0), f"P95={p95[idx]:.1e}", fontsize=6.2, color="#555555")
+    elif diagnostic_model:
+        rows = diagnostic_model.get("fne_curve") or []
+        layers = [str(r.get("name")) for r in rows]
+        cosines = np.asarray([float(r.get("cosine")) if isinstance(r.get("cosine"), (int, float)) else np.nan for r in rows])
+        p95 = np.asarray([float(r.get("p95")) if isinstance(r.get("p95"), (int, float)) else np.nan for r in rows])
+        x = np.arange(len(layers))
+        ax_outlier.plot(x, np.maximum(1 - cosines, 1e-12), marker="o", color="#2F6B9A", linewidth=1.4, markersize=3.5, label="1 - cosine")
+        ax_outlier.plot(x, np.maximum(p95, 1e-12), marker="s", color="#D7A12B", linewidth=1.1, markersize=3.2, label="P95 error")
+        ax_outlier.set_yscale("log")
+        ax_outlier.set_xticks(x, layers, rotation=35, ha="right")
+        ax_outlier.set_ylabel("metric value (log)")
+        ax_outlier.set_title(f"{diagnostic_model.get('display_name')}: bounded drift", loc="left", fontsize=8, fontweight="bold")
+        ax_outlier.legend(loc="lower right", fontsize=6)
     else:
-        ax_outlier.text(0.5, 0.5, "No outlier-dominated model available", ha="center", va="center")
+        ax_outlier.text(0.5, 0.5, "No diagnostic model available", ha="center", va="center")
     ax_outlier.text(-0.12, 1.04, "D", transform=ax_outlier.transAxes, fontweight="bold", fontsize=9)
 
     base = fig_dir / "figure_1_numeric_alignment"
@@ -1585,6 +1749,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_collect.add_argument("--max-models", type=int, default=None, help="Maximum number of models to execute from the selected suite")
     p_collect.add_argument("--no-pretrained", action="store_true", help="Smoke/debug only; formal runs should use pretrained weights")
     p_collect.add_argument("--allow-cpu-fallback", action="store_true", help="Allow GPU reference smoke collection without CUDA")
+    p_collect.add_argument(
+        "--isolate-models",
+        action="store_true",
+        help="Run each selected model in a fresh process to prevent cross-framework state leakage",
+    )
     p_collect.add_argument("--keep-going", action="store_true")
     p_collect.set_defaults(func=cmd_collect)
 

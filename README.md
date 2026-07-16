@@ -326,6 +326,99 @@ can consume source data without re-running model inference. For manuscript use, 
 `summary.md` and publication-oriented figure exports under `figures/`
 (`figure_1_numeric_alignment.svg`, `.pdf`, `.tiff`, and `.png`).
 
+### Persistent Model Weight Cache
+
+Model weights are external artifacts and must not be committed to Git. The
+model-suite runner uses one persistent cache root:
+
+```bash
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
+```
+
+Internally this maps to:
+
+```text
+$TBBCC_MODEL_CACHE/torch   # torchvision / torch.hub checkpoints
+$TBBCC_MODEL_CACHE/hf      # Hugging Face and diffusers snapshots
+$TBBCC_MODEL_CACHE/timm    # timm checkpoints, when used
+```
+
+Preferred method: download directly on the NPU server. Run this once after
+activating the target Python environment:
+
+```bash
+cd /home/ma-user/work/torchbridgebenchCCplugin
+source /home/ma-user/work/activate_torch4ms_ms272_cann85.sh
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
+python -m pip install -U huggingface_hub diffusers transformers accelerate safetensors
+python scripts/download_model_weights.py \
+  --suite benchmarks/model_zoo/suites/mixed_alignment_30min.json \
+  --cache-dir "$TBBCC_MODEL_CACHE"
+```
+
+The NPU model-suite runner automatically selects the pure-Python protobuf
+implementation. This avoids an import-order conflict between MindSpore 2.7.2
+and the newer protobuf required by ONNX Runtime; do not downgrade protobuf in
+this shared environment solely for the model suite.
+
+The script prepares the mixed-suite weights:
+
+- ResNet-18: `torchvision.models.ResNet18_Weights.IMAGENET1K_V1`
+- MobileNetV2: `torchvision.models.MobileNet_V2_Weights.IMAGENET1K_V1`
+- MiniMind-3o-MoE: `jingyaogong/minimind-3o-moe`
+- DDPM CIFAR-10 UNet: `google/ddpm-cifar10-32`
+
+For torchvision-only candidate weights, add:
+
+```bash
+python scripts/download_model_weights.py \
+  --suite benchmarks/model_zoo/suites/torchvision_candidates_v1.json \
+  --cache-dir "$TBBCC_MODEL_CACHE" \
+  --skip-hf
+```
+
+After the cache is populated, force offline/local use during formal NPU runs:
+
+```bash
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
+export TBBCC_HF_LOCAL_FILES_ONLY=1
+bash scripts/run_mixed_alignment_npu_bridge.sh
+```
+
+The mixed NPU suite isolates each model in a fresh Python process by default.
+This prevents PyTorch/torch4ms/MindSpore state from leaking between unrelated
+architectures and corrupting later numeric artifacts. Set
+`TBBCC_NPU_ISOLATE_MODELS=0` only for controlled diagnostics; the default
+four-model isolated run remains well within the 30-minute NPU budget.
+
+Fallback method: if the NPU server cannot reach PyTorch or Hugging Face model
+hosts, run the same cache-preparation command on a networked PC, then archive
+and upload the whole cache root:
+
+```bash
+cd /path/to/TBBCC
+export TBBCC_MODEL_CACHE=$PWD/tbbcc_model_cache
+python -m pip install -U torch torchvision huggingface_hub diffusers transformers accelerate safetensors
+python scripts/download_model_weights.py \
+  --suite benchmarks/model_zoo/suites/mixed_alignment_30min.json \
+  --cache-dir "$TBBCC_MODEL_CACHE"
+tar --zstd -cf tbbcc_model_cache_mixed.tar.zst -C "$PWD" tbbcc_model_cache
+sha256sum tbbcc_model_cache_mixed.tar.zst
+```
+
+On the NPU server, unpack it into the persistent work directory:
+
+```bash
+cd /home/ma-user/work
+tar --zstd -xf /path/to/tbbcc_model_cache_mixed.tar.zst
+export TBBCC_MODEL_CACHE=/home/ma-user/work/tbbcc_model_cache
+export TBBCC_HF_LOCAL_FILES_ONLY=1
+```
+
+The archive should contain `tbbcc_weight_manifest.json`. If a benchmark still
+tries to download from the network, first check that `TBBCC_MODEL_CACHE` points
+to the unpacked cache root and that `TBBCC_HF_LOCAL_FILES_ONLY=1` is set.
+
 ## Validation
 
 Validate the plugin manifest and inspect the plugin inventory:
