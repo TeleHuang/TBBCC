@@ -471,6 +471,169 @@ def test_persistent_worker_ignores_non_protocol_stdout(tmp_path: Path) -> None:
     assert "Invalid worker response" not in (result.traceback or "")
 
 
+def test_persistent_worker_run_case_timeout_kills_worker_and_marks_timed_out(tmp_path: Path) -> None:
+    worker = tbbcc.PersistentPythonWorker(
+        "target",
+        "",
+        {},
+        timeout=2,
+        artifact_root=tmp_path / "workers",
+    )
+    try:
+        result = worker.run_case(
+            "import time\nRESULT = 1\ntime.sleep(60)",
+            tmp_path / "artifacts",
+        )
+    finally:
+        worker.close()
+
+    assert result.ok is False
+    assert result.timed_out is True
+    assert result.returncode == 124
+    assert "timeout" in (result.traceback or "").lower()
+    assert worker.alive() is False
+
+
+def test_auto_classify_marks_timeout_as_harness_class_not_compatibility() -> None:
+    source = tbbcc.ExecResult(
+        role="source",
+        ok=True,
+        result={"value": 1.0},
+        activations=None,
+        gradients=None,
+        task_metrics=None,
+        returncode=0,
+        duration_seconds=0.1,
+        stdout="",
+        stderr="",
+        traceback=None,
+    )
+    target = tbbcc.ExecResult(
+        role="target",
+        ok=False,
+        result=None,
+        activations=None,
+        gradients=None,
+        task_metrics=None,
+        returncode=124,
+        duration_seconds=2.0,
+        stdout="",
+        stderr="Timeout after 2s",
+        traceback="TimeoutError('target worker timeout after 2s')",
+        timed_out=True,
+    )
+    classification = tbbcc.auto_classify(source, target, {"passed": False, "reason": "ExecutionFailure"})
+    assert classification["class"] == "Timeout"
+    assert classification["counts_toward_compatibility"] is False
+
+
+def test_eval_suite_restarts_persistent_worker_after_hung_case(tmp_path: Path) -> None:
+    cases_dir = tmp_path / "cases"
+    cases_dir.mkdir()
+    adapter = tmp_path / "adapter.json"
+    suite = tmp_path / "suite.json"
+    out = tmp_path / "out"
+    init_marker = tmp_path / "init_counts.json"
+    body_marker = tmp_path / "body_counts.json"
+    hang_case = cases_dir / "hang.json"
+    hang_case.write_text(
+        json.dumps(
+            {
+                "id": "unit/hang",
+                "level": "L1",
+                "track": "unit",
+                "code": "import time\nRESULT = 1\ntime.sleep(60)",
+                "expected_ops": [],
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ok_case = cases_dir / "ok.json"
+    ok_case.write_text(
+        json.dumps(
+            {
+                "id": "unit/ok",
+                "level": "L1",
+                "track": "unit",
+                "code": (
+                    "import json\n"
+                    "from pathlib import Path\n"
+                    f"marker = Path({str(body_marker)!r})\n"
+                    "data = json.loads(marker.read_text()) if marker.exists() else {'count': 0}\n"
+                    "data['count'] += 1\n"
+                    "marker.write_text(json.dumps(data))\n"
+                    "RESULT = 42\n"
+                ),
+                "expected_ops": [],
+                "ground_truth": {"atol": 0.0, "rtol": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+    preamble = (
+        "import json\n"
+        "from pathlib import Path\n"
+        f"marker = Path({str(init_marker)!r})\n"
+        "data = json.loads(marker.read_text()) if marker.exists() else {'source': 0, 'target': 0}\n"
+        "data[ROLE] += 1\n"
+        "marker.write_text(json.dumps(data))\n"
+    )
+    adapter.write_text(
+        json.dumps(
+            {
+                "bridge_id": "identity",
+                "track": "intercept",
+                "preamble": "ROLE = 'target'\n" + preamble,
+                "source_preamble": "ROLE = 'source'\n" + preamble,
+                "env": {},
+                "atol": 0.0,
+                "rtol": 0.0,
+                "timeout_seconds": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    suite.write_text(
+        json.dumps({"suite_id": "hang_restart", "cases": [str(hang_case), str(ok_case)], "adapters": [str(adapter)]}),
+        encoding="utf-8",
+    )
+
+    class Args:
+        effort_ledger = None
+        ar_baseline = None
+        timeout = None
+        atol = None
+        rtol = None
+        no_resume = True
+        isolated_per_case = False
+
+    args = Args()
+    args.suite = str(suite)
+    args.out = str(out)
+
+    # The hang case times out (both source and target workers are killed), the
+    # pair is restarted (preamble re-executed) and the following case still runs.
+    assert tbbcc.cmd_eval_suite(args) == 1
+    assert json.loads(init_marker.read_text(encoding="utf-8")) == {"source": 2, "target": 2}
+    # The ok case body runs once per worker (source + target).
+    assert json.loads(body_marker.read_text(encoding="utf-8")) == {"count": 2}
+    summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["worker_mode"] == "persistent"
+    assert summary["totals"]["worker_restarts"] == 1
+    assert summary["totals"]["passed"] == 1
+    assert summary["totals"]["failed"] == 1
+    assert summary["totals"]["compatibility_counted_total"] == 1
+    assert summary["totals"]["compatibility_counted_passed"] == 1
+    assert summary["totals"]["compatibility_rate"] == 1.0
+    assert summary["failure_classes"] == {"Timeout": 1}
+    by_case = {run["case_id"]: run for run in summary["runs"]}
+    assert by_case["unit/hang"]["failure_class"] == "Timeout"
+    assert by_case["unit/hang"]["counts_toward_compatibility"] is False
+    assert by_case["unit/ok"]["final_state"] == "ALL_PASS"
+    assert by_case["unit/ok"]["counts_toward_compatibility"] is True
+
+
 def test_original_torchbridgebench_torch4ms_report_is_anti_regression_fixture() -> None:
     report = Path("/home/ma-user/work/torchbridgebench/artifacts/reports/report_torch4ms_ms272_cann85_npu_20260510_clean.json")
     if not report.exists():

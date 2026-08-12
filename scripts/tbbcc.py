@@ -42,6 +42,7 @@ FAILURE_CLASSES = {
     "AdapterIncomplete",
     "HarnessFailure",
     "ProtocolContamination",
+    "Timeout",
     "OperatorNotFound",
     "TypeMismatch",
     "ShapeMismatch",
@@ -103,6 +104,7 @@ class ExecResult:
     stdout: str
     stderr: str
     traceback: str | None
+    timed_out: bool = False
 
 
 _TENSOR_SUMMARY_KEY = "__tbbcc_tensor_summary__"
@@ -484,6 +486,7 @@ def execute_python(role: str, preamble: str, code: str, env: dict[str, str], tim
                 stdout=_coerce_text(exc.stdout),
                 stderr=_coerce_text(exc.stderr) or f"Timeout after {timeout}s",
                 traceback=f"Timeout after {timeout}s",
+                timed_out=True,
             )
     end = _dt.datetime.now(_dt.UTC)
     payload = _extract_payload(proc.stdout)
@@ -520,6 +523,8 @@ def execute_python_pair(source_preamble: str, target_preamble: str, code: str, e
 class PersistentPythonWorker:
     def __init__(self, role: str, preamble: str, env: dict[str, str], timeout: int, artifact_root: Path):
         self.role = role
+        self.preamble = preamble
+        self.env = env
         self.timeout = timeout
         self.artifact_root = artifact_root
         self._tmp = tempfile.TemporaryDirectory(prefix="tbbcc_worker_")
@@ -548,15 +553,19 @@ class PersistentPythonWorker:
             self.close()
             raise RuntimeError(f"{role} worker init error: {tb}")
 
-    def _read_stdout_line(self, timeout: int) -> str:
+    def _read_stdout_line(self, timeout: float) -> str:
         import queue
         import threading
 
         q: queue.Queue[str] = queue.Queue(maxsize=1)
+        # Capture the pipe locally so the reader thread is immune to close()
+        # replacing self.proc mid-read.
+        stream = self.proc.stdout if self.proc is not None else None
+        if stream is None:
+            raise RuntimeError(f"{self.role} worker is not running")
 
         def _reader() -> None:
-            assert self.proc.stdout is not None
-            q.put(self.proc.stdout.readline())
+            q.put(stream.readline())
 
         thread = threading.Thread(target=_reader, daemon=True)
         thread.start()
@@ -570,16 +579,23 @@ class PersistentPythonWorker:
             raise RuntimeError(f"{self.role} worker exited unexpectedly: {stderr}")
         return line
 
-    def _read_protocol_line(self, prefix: str, timeout: int) -> tuple[str, list[str]]:
+    def _read_protocol_line(self, prefix: str, timeout: int, deadline: _dt.datetime | None = None) -> tuple[str, list[str]]:
         noise: list[str] = []
         while True:
-            line = self._read_stdout_line(timeout)
+            remaining: float = timeout
+            if deadline is not None:
+                left = (deadline - _dt.datetime.now(_dt.UTC)).total_seconds()
+                if left <= 0:
+                    self.close()
+                    raise TimeoutError(f"{self.role} worker timeout after {timeout}s")
+                remaining = min(timeout, left)
+            line = self._read_stdout_line(remaining)
             if line.startswith(prefix):
                 return line, noise
             noise.append(line)
 
     def _read_stderr_nonblocking(self) -> str:
-        if self.proc.stderr is None:
+        if self.proc is None or self.proc.stderr is None:
             return ""
         try:
             import select
@@ -599,6 +615,8 @@ class PersistentPythonWorker:
         request_id = uuid.uuid4().hex
         role_artifact_dir = case_artifact_dir / self.role
         role_artifact_dir.mkdir(parents=True, exist_ok=True)
+        if self.proc is None:
+            raise RuntimeError(f"{self.role} worker is not running")
         if self.proc.stdin is None:
             raise RuntimeError(f"{self.role} worker stdin unavailable")
         request = {
@@ -606,13 +624,23 @@ class PersistentPythonWorker:
             "code": code,
             "artifact_dir": str(role_artifact_dir),
         }
+        # Framework-level per-case wall-clock budget. Unlike the per-line
+        # protocol read timeout, this deadline bounds the whole case even when
+        # the bridge keeps emitting noise lines while wedged on an operator.
+        deadline = start + _dt.timedelta(seconds=self.timeout)
         try:
             self.proc.stdin.write(json.dumps(request) + "\n")
             self.proc.stdin.flush()
-            line, noise = self._read_protocol_line("TBBCC_WORKER_RESULT_JSON=", self.timeout)
+            line, noise = self._read_protocol_line("TBBCC_WORKER_RESULT_JSON=", self.timeout, deadline=deadline)
             self.stdout_noise.extend(noise)
         except Exception as exc:
             end = _dt.datetime.now(_dt.UTC)
+            timed_out = isinstance(exc, TimeoutError)
+            returncode = 124 if timed_out else 1
+            if self.proc is not None:
+                rc = self.proc.poll()
+                if rc is not None:
+                    returncode = rc
             return ExecResult(
                 role=self.role,
                 ok=False,
@@ -620,11 +648,12 @@ class PersistentPythonWorker:
                 activations=None,
                 gradients=None,
                 task_metrics=None,
-                returncode=self.proc.poll() if self.proc.poll() is not None else 1,
+                returncode=returncode,
                 duration_seconds=(end - start).total_seconds(),
                 stdout="",
                 stderr=self._read_stderr_nonblocking() or repr(exc),
                 traceback=repr(exc),
+                timed_out=timed_out,
             )
         end = _dt.datetime.now(_dt.UTC)
         payload = json.loads(line.split("=", 1)[1])
@@ -658,7 +687,14 @@ class PersistentPythonWorker:
             traceback=tb,
         )
 
+    def alive(self) -> bool:
+        """True while the worker subprocess is running and usable."""
+        return self.proc is not None and self.proc.poll() is None
+
     def close(self) -> None:
+        if self.proc is None:
+            self._tmp.cleanup()
+            return
         try:
             if self.proc.stdin:
                 self.proc.stdin.close()
@@ -673,12 +709,19 @@ class PersistentPythonWorker:
             except Exception:
                 pass
         self._tmp.cleanup()
+        self.proc = None
 
 
 class PersistentWorkerPair:
     def __init__(self, adapter: AdapterSpec, timeout: int, artifact_root: Path):
+        self.adapter = adapter
+        self.timeout = timeout
+        self.artifact_root = artifact_root
         self.source = PersistentPythonWorker("source", adapter.source_preamble, {}, timeout, artifact_root)
         self.target = PersistentPythonWorker("target", adapter.preamble, adapter.env, timeout, artifact_root)
+
+    def alive(self) -> bool:
+        return self.source.alive() and self.target.alive()
 
     def run_pair(self, code: str, artifact_dir: Path) -> tuple[ExecResult, ExecResult]:
         return self.source.run_case(code, artifact_dir), self.target.run_case(code, artifact_dir)
@@ -1164,7 +1207,13 @@ def auto_classify(
     lower = tb.lower()
     cls = "NoFailure"
 
-    if not source.ok:
+    if source.timed_out or target.timed_out:
+        # Framework-level per-case timeout. The worker was killed by the harness
+        # (not a bridge compatibility verdict), so classify as harness-class
+        # Timeout and exclude from the compatibility denominator.
+        cls = "Timeout"
+        evidence.append("worker timed out under the framework-level per-case budget")
+    elif not source.ok:
         cls = "EnvironmentFailure"
         evidence.append("baseline execution failed")
     elif not target.ok:
@@ -1218,6 +1267,7 @@ def auto_classify(
             "AdapterIncomplete",
             "HarnessFailure",
             "ProtocolContamination",
+            "Timeout",
         },
     }
 
@@ -1854,6 +1904,7 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
     worker_mode = "isolated_per_case" if isolated_per_case else "persistent"
     worker_pairs: dict[str, PersistentWorkerPair] = {}
     worker_fallback_errors: list[str] = []
+    worker_restarts = 0
 
     def _load_existing_report(path: Path) -> dict[str, Any] | None:
         if not resume_enabled or not path.exists():
@@ -1974,7 +2025,14 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
                     adapter_key = str(adapter_path.resolve())
                     try:
                         pair = worker_pairs.get(adapter_key)
-                        if pair is None:
+                        if pair is None or not pair.alive():
+                            if pair is not None:
+                                # Previous worker died (hung operator killed it,
+                                # or it crashed). Reap it and start a fresh pair
+                                # so a hung bridge case does not poison the rest
+                                # of the suite.
+                                pair.close()
+                                worker_restarts += 1
                             pair = PersistentWorkerPair(adapter_obj, timeout, out_dir / ".workers" / _slug(adapter_obj.bridge_id))
                             worker_pairs[adapter_key] = pair
                         source, target = pair.run_pair(case_obj.code, artifact_dir)
@@ -2029,6 +2087,7 @@ def cmd_eval_suite(args: argparse.Namespace) -> int:
             "skipped": skipped,
             "resume_enabled": resume_enabled,
             "worker_mode": worker_mode,
+            "worker_restarts": worker_restarts,
             "compatibility_counted_total": compatibility_total,
             "compatibility_counted_passed": compatibility_passed,
             "compatibility_rate": (compatibility_passed / compatibility_total) if compatibility_total else None,
